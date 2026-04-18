@@ -48,13 +48,32 @@ else:
 
 
 @app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution_json: str, max_workloads: int = 0, max_seq_len: int = 0) -> dict:
+def run_benchmark(
+    solution_json: str,
+    max_workloads: int = 0,
+    max_seq_len: int = 0,
+    min_seq_len: int = 0,
+    dump_sass: bool = False,
+) -> dict:
     """Run benchmark on Modal B200 and return results.
 
     max_workloads: if >0, cap the number of workloads (smallest seqs first).
     max_seq_len:   if >0, drop workloads whose total_seq_len exceeds this bound —
                    useful for excluding the 8192-token reference-Python baselines.
+    min_seq_len:   if >0, drop workloads whose total_seq_len is below this bound —
+                   used to bench long-seq prefill behavior.
+    dump_sass:     if True, sets MSINFER_DUMP_SASS=1 so msinfer_entry.py emits
+                   PTX/cubin/ptxas-verbose into /tmp/cute-asm, then tars + base64
+                   encodes the directory into the returned dict's `sass_dump`.
     """
+    import base64
+    import io
+    import os
+    import tarfile
+
+    if dump_sass:
+        os.environ["MSINFER_DUMP_SASS"] = "1"
+
     from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
     solution = Solution.model_validate_json(solution_json)
@@ -81,6 +100,16 @@ def run_benchmark(solution_json: str, max_workloads: int = 0, max_seq_len: int =
         before = len(workloads)
         workloads = [w for w in workloads if _len_key(w) <= max_seq_len]
         print(f"Filtered to {len(workloads)} workloads with total_seq_len ≤ {max_seq_len} (from {before})")
+
+    if min_seq_len > 0:
+        before = len(workloads)
+        workloads = [w for w in workloads if _len_key(w) >= min_seq_len]
+        print(f"Filtered to {len(workloads)} workloads with total_seq_len ≥ {min_seq_len} (from {before})")
+
+    if not workloads:
+        raise ValueError(
+            f"No workloads remain after filters max_seq_len={max_seq_len}, min_seq_len={min_seq_len}"
+        )
 
     if max_workloads > 0 and len(workloads) > max_workloads:
         # Sort by total_seq_len asc, pick smallest N.
@@ -122,7 +151,23 @@ def run_benchmark(solution_json: str, max_workloads: int = 0, max_seq_len: int =
             log_text = getattr(trace.evaluation, "log", "") or ""
             if log_text and trace.evaluation.status.value != "PASSED":
                 entry["log_tail"] = log_text[-6000:] if len(log_text) > 6000 else log_text
+            # When SASS dumping is enabled, surface the ptxas verbose lines on
+            # the PASSED path too so perf claims are grounded in SASS stats.
+            if dump_sass and log_text:
+                ptxas_lines = [
+                    ln for ln in log_text.splitlines()
+                    if "ptxas" in ln.lower() or "registers" in ln or "spill" in ln or "smem" in ln
+                ]
+                if ptxas_lines:
+                    entry["ptxas_tail"] = "\n".join(ptxas_lines[-40:])
             results[definition.name][trace.workload.uuid] = entry
+
+    if dump_sass and os.path.isdir("/tmp/cute-asm"):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            tf.add("/tmp/cute-asm", arcname="cute-asm")
+        results["_sass_tarball_b64"] = base64.b64encode(buf.getvalue()).decode("ascii")
+        print(f"SASS dump size: {len(buf.getvalue())} B (base64 in results._sass_tarball_b64)")
 
     return results
 
@@ -155,9 +200,22 @@ def print_results(results: dict):
                     print(f"    {line}")
                 print("    --- end log ---")
 
+            ptxas_tail = result.get("ptxas_tail")
+            if ptxas_tail:
+                print("    --- ptxas-verbose ---")
+                for line in ptxas_tail.splitlines():
+                    print(f"    {line}")
+                print("    --- end ptxas ---")
+
 
 @app.local_entrypoint()
-def main(max_workloads: int = 0, max_seq_len: int = 0):
+def main(
+    max_workloads: int = 0,
+    max_seq_len: int = 0,
+    min_seq_len: int = 0,
+    dump_sass: bool = False,
+    sass_out: str = "out/sass-dump.tar.gz",
+):
     """Pack solution and run benchmark on Modal."""
     # Attempt flashinfer-bench-based packing first; fall back to a minimal
     # local JSON packer when the library isn't installed locally (e.g. macOS).
@@ -174,8 +232,27 @@ def main(max_workloads: int = 0, max_seq_len: int = 0):
     meta = _json.loads(solution_json)
     print(f"Loaded: {meta['name']} ({meta['definition']})")
 
-    print(f"\nRunning benchmark on Modal B200 (max_workloads={max_workloads}, max_seq_len={max_seq_len})...")
-    results = run_benchmark.remote(solution_json, max_workloads=max_workloads, max_seq_len=max_seq_len)
+    print(
+        f"\nRunning benchmark on Modal B200 "
+        f"(max_workloads={max_workloads}, max_seq_len={max_seq_len}, "
+        f"min_seq_len={min_seq_len}, dump_sass={dump_sass})..."
+    )
+    results = run_benchmark.remote(
+        solution_json,
+        max_workloads=max_workloads,
+        max_seq_len=max_seq_len,
+        min_seq_len=min_seq_len,
+        dump_sass=dump_sass,
+    )
+
+    # If SASS dumping was requested, peel off the tarball before print_results.
+    if isinstance(results, dict) and "_sass_tarball_b64" in results:
+        import base64 as _b64
+        blob = _b64.b64decode(results.pop("_sass_tarball_b64"))
+        out_path = Path(sass_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(blob)
+        print(f"SASS dump written to {out_path} ({len(blob)} B)")
 
     if not results:
         print("No results returned!")

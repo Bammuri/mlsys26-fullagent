@@ -21,6 +21,7 @@ is deterministic across environments.
 from __future__ import annotations
 
 import math
+import os
 import threading
 from typing import Any, Callable, Dict, Tuple
 
@@ -49,11 +50,24 @@ kWarpThreads  = kRowsPerBlock   # 32 — one warp per block
 
 # ----------------------------------------------------------------------------
 # Compile options — sm_100a + -O3 + fast math are the ones that move SASS.
+# MSINFER_DUMP_SASS=1 additionally emits PTX/cubin + ptxas -v stats so the
+# runner log captures register/spill/barrier/smem counts for the unit under
+# test. Default path is unchanged (no extra work on the compile critical path).
 # ----------------------------------------------------------------------------
+_DUMP_SASS     = os.environ.get("MSINFER_DUMP_SASS") == "1"
+_SASS_DUMP_DIR = os.environ.get("MSINFER_SASS_DIR", "/tmp/cute-asm")
+if _DUMP_SASS:
+    os.makedirs(_SASS_DUMP_DIR, exist_ok=True)
+
 _COMPILE_OPTS = (
     "--enable-tvm-ffi "
     "--gpu-arch=sm_100a "
     "--opt-level=3"
+    + (
+        f" --keep-ptx --keep-cubin --dump-dir={_SASS_DUMP_DIR} --ptxas-options=-v"
+        if _DUMP_SASS
+        else ""
+    )
 )
 
 # Per-shape compiled-callable cache (thread-safe).
@@ -146,10 +160,11 @@ def _gdn_decode_dev(
         qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
     # Fused first pass — vectorized state load (ldg.128 × 32 tiles).
-    #   sr is held as 32 × 4 float tiles; each iteration loads one float4
-    #   slice via `local_tile` + `autovec_copy` so the DSL emits 128-bit
-    #   gmem reads instead of 128 scalar 32-bit reads.
-    sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
+    #   sr is held as a 2D (32, 4) register tile — outer axis = the 32 vec-tiles
+    #   along D, inner axis = 4 fp32 inside each tile. Matches v17's
+    #   `float4 sr[kVecsPerRow=32]` shape and lets the DSL emit vector register
+    #   moves + vectorized gmem/smem reads on the inner axis.
+    sr = cute.make_rmem_tensor(cute.make_layout((D // 4, 4), stride=(4, 1)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
@@ -160,7 +175,7 @@ def _gdn_decode_dev(
         cute.autovec_copy(state_tile, tmp)
         for c in cutlass.range_constexpr(4):
             s = tmp[c] * g
-            sr[i * 4 + c] = s
+            sr[i, c] = s
             ov += sK[i * 4 + c] * s
             qs += sQ[i * 4 + c] * s
 
@@ -171,7 +186,7 @@ def _gdn_decode_dev(
     # Second pass — vectorized state store (stg.128 × 32 tiles).
     for i in cutlass.range_constexpr(D // 4):
         for c in cutlass.range_constexpr(4):
-            tmp[c] = sr[i * 4 + c] + sK[i * 4 + c] * delta
+            tmp[c] = sr[i, c] + sK[i * 4 + c] * delta
         state_tile = cute.local_tile(
             state_out, (1, 1, 1, 4), (batch, v_head, row, i),
         )
@@ -240,8 +255,10 @@ def _gdn_prefill_dev(
     A_log_val   = cutlass.Float32(A_log[v_head])
     dt_bias_val = cutlass.Float32(dt_bias[v_head])
 
-    # Load this row of state_in into a register array once; mutate in place.
-    # Vectorized ldg.128 × 32 tiles.
+    # Load this row of state_in into a flat (D,) register array; mutate in place
+    # across the token loop. 2D reshape explodes DSL compile time when composed
+    # with the runtime token loop, so keep it flat here. Vectorized gmem read
+    # still via local_tile + autovec_copy on a (4,) staging reg.
     sr = cute.make_rmem_tensor(cute.make_layout((D,), stride=(1,)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
     for i in cutlass.range_constexpr(D // 4):

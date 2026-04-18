@@ -1,11 +1,11 @@
 [solution]
-name = "gdn-cute-decode-v4"                    # Solution name
-definition = "gdn_decode_qk4_v8_d128_k_last"   # Benchmark definition name
+name = "gdn-cute-prefill-v5"                   # Solution name
+definition = "gdn_prefill_qk4_v8_d128_k_last"  # Benchmark definition name
 author = "team"                                # Team/author name
 
 [build]
 language = "python"                            # python | triton | cuda
-entry_point = "msinfer_entry.py::run"          # swap to "::run_prefill" for prefill
+entry_point = "msinfer_entry.py::run_prefill"  # swap to "::run" for decode
 dependencies = [
     "nvidia-cutlass-dsl==4.4.2",
     "cuda-python==13.2.0",
