@@ -102,6 +102,7 @@ def run_benchmark(solution_json: str, max_workloads: int = 0, max_seq_len: int =
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
 
+    import pathlib as _pl
     for trace in traces:
         if trace.evaluation:
             entry = {
@@ -115,6 +116,12 @@ def run_benchmark(solution_json: str, max_workloads: int = 0, max_seq_len: int =
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            # On non-PASSED status, surface the captured stdio log — the
+            # PersistentRunner redirects stdio to a per-worker file that
+            # the evaluator inlines into Evaluation.log.
+            log_text = getattr(trace.evaluation, "log", "") or ""
+            if log_text and trace.evaluation.status.value != "PASSED":
+                entry["log_tail"] = log_text[-6000:] if len(log_text) > 6000 else log_text
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -140,6 +147,13 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+            tail = result.get("log_tail")
+            if tail:
+                print("    --- worker log tail (last 6 KB) ---")
+                for line in tail.splitlines():
+                    print(f"    {line}")
+                print("    --- end log ---")
 
 
 @app.local_entrypoint()

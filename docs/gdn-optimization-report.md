@@ -156,6 +156,20 @@ This also eliminates Q reads in the second pass — only K is touched — halvin
 | **Prefill v7** | Shared-mem K/Q + cp.async.cg double-buffer + **`qs + δ·qk` + in-place g·state** (v7) + 4-way V-split |
 | **Decode v17** | Single-pass state + pre-scaled g·state + `out = qs + δ·qk` + 4-way V-split + scalar-via-register broadcast |
 
+### Python + CuTe DSL port (scoring surface, `solution/python/msinfer_entry.py`)
+
+| step | commit | change | decode kernel latency | prefill kernel latency |
+|------|--------|--------|---------:|---------:|
+| v1 | fdddc20 | CuTe surface, 128-thread block, cross-warp qk smem reduce | 0.0354 ms | 0.0534 ms |
+| v2 | 17cf8b2 | 4-way V-split, 32-thread warp block, warp-only qk reduce | 0.0248 ms (-30%) | 0.0380 ms (-29%) |
+| v3 | c23802c | Vectorized state via `cute.local_tile` + `cute.autovec_copy` (emits LDG/STG.128) | 0.0193 ms (-22%) | 0.0372 ms (-2%) |
+| v4 | fd3a81b | `cute.arch.sync_warp()` in place of `barrier()` (bar.warp.sync vs bar.sync 0) | 0.025 ms† | 0.0364 ms (-2%) |
+| ref | static CUDA | v17 decode / v7 prefill, hand-tuned nvcc | 0.012 ms | 0.0304 ms |
+
+†Modal run-to-run variance on Python reference latency is ~30–70% (cold-start scheduling). Kernel latency between v3 and v4 runs is within noise; the sync_warp swap is semantically correct for 1-warp blocks and at worst neutral.
+
+All 35 tested workloads (30 decode × batch ∈ {1,4,8,16} + 5 prefill seq_len ≤ 30) PASSED within contest tolerance (abs_err ≤ 1e-6, rel_err ≤ 1e-1).
+
 ### Measured on Modal B200 (`flashinfer/flashinfer-ci-cu132`, CUDA 13.2)
 
 Prefill v7 — 20 smallest workloads (total_seq_len ≤ 35):
