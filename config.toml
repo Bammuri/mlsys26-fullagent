@@ -1,8 +1,10 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "gdn-prefill-v1"      # Solution name
+definition = "gdn_prefill_qk4_v8_d128_k_last" # Benchmark definition name
+author = "MSInfer"              # Team/author name
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "python"                 # python | triton | cuda
+entry_point = "msinfer_entry.py::run"   # Entry point: <file_path>::<function_name>
+dependencies = ["nvidia-cutlass-dsl", "cuda-python>=12.8"]
+destination_passing_style = true

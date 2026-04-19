@@ -1,9 +1,10 @@
 """
 FlashInfer-Bench Local Benchmark Runner.
 
-Automatically packs the solution from source files and runs benchmarks locally.
+Runs benchmarks locally using either a packed solution JSON or source files.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -15,6 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 from scripts.pack_solution import pack_solution
 
+SUCCESS_STATUSES = {"OK", "PASSED"}
+
 
 def get_trace_set_path() -> str:
     """Get trace set path from environment variable."""
@@ -22,7 +25,7 @@ def get_trace_set_path() -> str:
     if not path:
         raise EnvironmentError(
             "FIB_DATASET_PATH environment variable not set. "
-            "Please set it to the path of your flashinfer-trace dataset."
+            "Please set it to the path of your mlsys26-contest dataset."
         )
     return path
 
@@ -30,7 +33,7 @@ def get_trace_set_path() -> str:
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark locally and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=3, iterations=10, num_trials=1)
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
@@ -76,10 +79,50 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     return results
 
 
-def print_results(results: dict):
+def print_results(results: dict, summary_only: bool = False):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
+        total = len(traces)
+        statuses = {}
+        latency_values = []
+        speedup_values = []
+        abs_errors = []
+        rel_errors = []
+
+        for result in traces.values():
+            status = result.get("status", "UNKNOWN")
+            statuses[status] = statuses.get(status, 0) + 1
+            if result.get("latency_ms") is not None:
+                latency_values.append(result["latency_ms"])
+            if result.get("speedup_factor") is not None:
+                speedup_values.append(result["speedup_factor"])
+            if result.get("max_abs_error") is not None:
+                abs_errors.append(result["max_abs_error"])
+            if result.get("max_rel_error") is not None:
+                rel_errors.append(result["max_rel_error"])
+
         print(f"\n{def_name}:")
+        print(f"  workloads: {total}")
+        print("  status counts:", ", ".join(f"{k}={v}" for k, v in sorted(statuses.items())))
+        if latency_values:
+            print(f"  avg latency: {sum(latency_values) / len(latency_values):.3f} ms")
+        if speedup_values:
+            print(f"  avg speedup: {sum(speedup_values) / len(speedup_values):.2f}x")
+        if abs_errors:
+            print(f"  worst abs error: {max(abs_errors):.2e}")
+        if rel_errors:
+            print(f"  worst rel error: {max(rel_errors):.2e}")
+
+        if summary_only:
+            failed = [
+                uuid[:8]
+                for uuid, result in traces.items()
+                if result.get("status") not in SUCCESS_STATUSES
+            ]
+            if failed:
+                print(f"  failed workloads: {', '.join(failed)}")
+            continue
+
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
@@ -98,14 +141,41 @@ def print_results(results: dict):
             print()
 
 
-def main():
-    """Pack solution and run benchmark."""
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+def load_solution(solution_path: Path | None = None) -> Solution:
+    """Load a solution from JSON or pack it from source files."""
+    if solution_path is None:
+        print("Packing solution from source files...")
+        solution_path = pack_solution()
+    else:
+        print(f"Loading solution from JSON: {solution_path}")
 
     print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
+    solution = Solution.model_validate_json(Path(solution_path).read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
+    return solution
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="Run local FlashInfer benchmarks")
+    parser.add_argument(
+        "--solution-path",
+        type=Path,
+        default=None,
+        help="Path to an existing solution JSON. If omitted, pack from local source files.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print only aggregated benchmark summary instead of per-workload details.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    """Load the solution and run benchmark."""
+    args = parse_args()
+    solution = load_solution(args.solution_path)
 
     print("\nRunning benchmark...")
     results = run_benchmark(solution)
@@ -114,7 +184,7 @@ def main():
         print("No results returned!")
         return
 
-    print_results(results)
+    print_results(results, summary_only=args.summary_only)
 
 
 if __name__ == "__main__":
