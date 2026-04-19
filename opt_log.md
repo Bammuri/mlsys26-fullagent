@@ -144,6 +144,13 @@ After K3, E3, G1 (2 variants), H1, H2: **all micro-tuning candidates on the recu
 | 6 | H1 — 4 warps/block | +0.007 ms (+1.8%) | REVERT |
 | 7 | H2 — min-blocks 8 | +0.004 ms (+1.0%) | REVERT |
 | 9 | F1 — algebraic decouple of out | −0.004 ms (−1.0%) | KEEP |
+| 10 | F2 — `#pragma unroll 2` | −0.050 ms (−12.8%) | KEEP |
+| 11 | F3 — `#pragma unroll 4` | −0.093 ms (−23.8%) | KEEP |
+| 12 | F4 — `#pragma unroll 8` | −0.110 ms (−28.1%) | KEEP |
+| 13 | F5 — `#pragma unroll 16` | +0.010 ms (+2.6%) | REVERT |
+| 14 | F6 — `#pragma unroll 12` | −0.070 ms (−17.9%) | REVERT (worse than F4) |
+| 15 | F7 — drop warp_broadcast_0 ×3 | −0.123 ms (−31.5%) | KEEP |
+| 16 | F8 — retry unroll 16 post-F7 | −0.019 ms (−4.9%) | REVERT (worse than F7) |
 
 **Root cause of the ceiling**: the current kernel is a **serial per-token recurrent FMA chain** per (seq, head, row). Each token requires completion of the previous token's state update. No amount of (1) occupancy tuning, (2) hint-level tuning, (3) load-path tuning, or (4) SFU/launch-overhead fusion can break Amdahl's bound when the arithmetic is on a fundamental per-token dependency chain.
 
@@ -152,6 +159,22 @@ Phase-1 target is **0.150 ms**. Current: **0.391 ms** → **2.6× speedup still 
 **The only remaining Phase-1 candidate** is **E1** (128-bit packed bf16 loads for Q/K) — halves the number of ldg.v4.b16 instructions per token. Since the kernel is partially memory-bound on Q/K reads (bf16, 4 loads/lane/token), this could yield 5-15% (0.35-0.37 ms). Still far from 0.150 ms.
 
 **Verdict**: Phase 1 optimizations alone cannot reach 0.150 ms. **Phase 2 chunkwise rewrite is mandatory** to close the 2.6× gap. The chunkwise rewrite replaces the per-token serial chain with a per-chunk GEMM-style parallel computation (WY compact form + γ_cum trick) that amortizes state updates across CHUNK_SIZE tokens in parallel — O(T/CHUNK_SIZE) serial steps instead of O(T).
+
+### Iterations 10-16 — F2-F8: `#pragma unroll` sweep + scalar-broadcast removal
+
+| # | Change | Latency (ms) | Δ vs prev kept | Decision |
+|---|--------|---:|---:|---|
+| 10 | F2: `#pragma unroll 2` | 0.341 | −0.046 (−11.9%) | KEEP |
+| 11 | F3: `#pragma unroll 4` | 0.298 | −0.043 (−12.6%) | KEEP |
+| 12 | F4: `#pragma unroll 8` | 0.281 | −0.017 (−5.7%) | KEEP |
+| 13 | F5: `#pragma unroll 16` | 0.401 | +0.120 (+42.7%) | REVERT |
+| 14 | F6: `#pragma unroll 12` | 0.321 | +0.040 (+14.2%) | REVERT |
+| 15 | F7: drop 3× `warp_broadcast_0` for gate/beta/v (all-lane scalar reads — L1 coalesces, saves 3 shuffles/token) | 0.268 | −0.013 (−4.6%) | KEEP |
+| 16 | F8: retry `unroll 16` post-F7 (hoping broadcast removal freed regs) | 0.372 | +0.104 (+38.8%) | REVERT |
+
+**Final unroll sweep verdict**: `#pragma unroll 8` is the sweet spot. Higher (12, 16) spills regs to local memory; lower (2, 4) leaves ILP on the table. Removing the 3 lane-0 broadcasts (F7) was a clean structural win — same data flows but 3 fewer shuffles per token, and L1 coalesces the all-lane scalar reads (gate/beta/v are tiny).
+
+**Cumulative Phase-1 progress**: 0.537 ms (random seed baseline) → 0.391 ms (deterministic K3 baseline) → **0.268 ms** (post-F7) — a real 31% reduction off the K3 baseline (50% off the random baseline). The F-series (algebraic decouple + unroll) was the productive vein; the earlier E/G/H/E1-lite candidates all regressed because they targeted the wrong bottleneck.
 
 ### Iteration 9 — F1: algebraic decoupling of `out` from state update  → KEEP
 - Change: previously `out = warp_sum(<q, state_after>)` — depended on the post-FMA state, so the per-token critical path was butterfly_kS → state_update (4 FMA) → butterfly_out → store. Rewrote `out = γ·<q,S_old> + <q,k>·diff` (algebraically equivalent), so all three reductions (`<k,S>`, `<q,S>`, `<q,k>`) depend only on **pre-update** values and can be issued in parallel with each other; `out` is then computed by 2 multiplies + 1 add.
@@ -228,6 +251,50 @@ The critical insight: **state-update becomes a matrix-matrix multiply over C tok
 - Measure; if neutral-to-win, proceed to B1b (warp-level within-chunk parallelism).
 - Stop and report to user before committing to the full Phase 2 structural rewrite if chunked scaffold itself regresses materially.
 
+---
+
+## Phase-2 execution log
+
+### Iteration 17 — B1a scaffold: chunked outer loop + SMEM-staged gate/β  → KEEP (neutral)
+- Change: introduced `constexpr int kChunkSize = 64`; wrapped the per-token hot loop in an outer chunk loop. At each chunk boundary, threads `< C_actual` cooperatively load `gate_beta[(chunk_start+tid)*kNumVHeads + head_idx]` into a shared `float2 sh_gate_beta[kChunkSize]`, followed by `__syncthreads()`. Hot loop now reads `sh_gate_beta[i]` instead of the per-token global `gate_beta` access. No math change, no other load/compute restructuring.
+- Intent: establish chunked control flow (B1a milestone in §7). Serves as the scaffold the real chunkwise rewrite will mount onto. The point is not speedup — it is to prove the chunked structure does not regress before adding parallel-within-chunk work.
+- Avg latency: **0.268 ms** (unchanged vs F7 baseline 0.268 ms) | 30/30 PASSED | abs_err 6.10e-05 unchanged | rel_err 2.97e-01 unchanged | avg speedup 597.83×.
+- Δ: **±0.000 ms (neutral)** — exactly what the scaffold should look like. gate/β was already well-cached (not a bottleneck), so SMEM staging buys nothing *yet*; but the critical-path chunk boundaries and SMEM layout are now in place for M3/M4 (γ_cum LUT) and warp-parallel state updates to plug into.
+- Decision: KEEP. No regression means the chunking overhead (outer loop + 2 `__syncthreads` per chunk) is absorbed. Next iteration can now consume `sh_gate_beta` alongside new per-chunk staged data.
+
+### NEXT ACTION (post iter 17)
+- Proceed with **M3 prefix-sum LUT** layered onto the iter-17 scaffold: at chunk entry, cooperatively compute `sh_loggate_cum[i] = Σ_{j≤i} log(gate[chunk_start+j])` (warp-level prefix sum, or 64-thread Hillis-Steele since we have up to 64 tokens/chunk and 64 threads/block). This is the prerequisite for M1 (γ_intra factorization) which in turn enables B1/B1b (parallel-within-chunk state update and output).
+- Measure after each M-step individually; abort-and-pivot to Phase 3 (wgmma) if two consecutive M-steps fail to buy ≥5%.
+- Keep `kChunkSize=64` until warp count changes (Phase 3 will retune).
+
+### Iteration 18 — G1 chunked cooperative gate/β fusion  → KEEP
+- Change: folded `compute_gate_beta_kernel` into `gdn_prefill_kernel`. At each chunk entry, the 64 threads in the block cooperatively compute `gate = expf(-expf(A_log[h]) · softplus(a[t]+dt_bias[h]))` and `beta = sigmoid(b[t])` for their assigned token (`threadIdx.x < C_actual`) and write the pair into `sh_gate_beta[threadIdx.x]`. Per-head constants `a_log_exp = expf(A_log[h])` and `dt_bias_h = dt_bias[h]` are preloaded once at block entry. Host side drops the `gate_beta` tensor allocation, the pre-kernel launch, and the launch-check. The dead `compute_gate_beta_kernel` definition is removed.
+- Why this variant works where iter 5a/5b failed: parallel-across-threads at chunk entry costs each thread exactly 4 SFU ops per chunk (one token), then the hot loop reads from SMEM as before. iter 5a/5b serialized the SFU chain *inside* the hot loop, inflating the critical path. Here the SFU work is outside the per-token carry.
+- Savings: one kernel launch per call (~5-15μs); a `T × kNumVHeads × 2 × f32` write/read roundtrip through global memory; buffer allocation / deallocation overhead.
+- Added work: `ceil(T_seq/64) × 4_SFU` compute per block replicated across `64 row_tiles × 8 v_heads × num_seqs` blocks (redundant compute across row_tiles sharing the same head). This is ~64× redundant but each per-chunk cost is ~64 cycles / thread, amortized over the chunk's hot-loop iterations.
+- Avg latency: **0.265 ms** (prev 0.268 ms) | 30/30 PASSED | abs_err 6.10e-05 unchanged | rel_err 2.97e-01 unchanged | avg speedup 599.48×.
+- Δ: **−0.003 ms (−1.1%)** — small but measurable win. KEEP.
+- Reading: the wins match the saved launch + I/O roundtrip roughly; the 64× redundant SFU compute is not visible in wall-time, confirming the hot loop is bandwidth/carry-bound, not SFU-bound. This frees the path to merge more work (γ_cum LUT, βK precompute) into the same per-chunk cooperative-prelude without expecting SFU overhead to regress.
+
+### NEXT ACTION (post iter 18)
+- Iter 19 candidate: **M3 γ_cum LUT** — at chunk entry, extend the cooperative prelude so each thread also writes `sh_loggate[tid] = log(gate)` (free, already computed `-a_log_exp · softplus(x)` = log(gate)). Then do a 64-thread Hillis-Steele inclusive prefix sum to produce `sh_loggate_cum[0..C_actual)` in SMEM. Consumer arrives in iter 20+ when M1 lands. Iter 19 itself should measure neutral (scaffold-only); if it regresses, the prefix-scan implementation is buggy or too heavy — diagnose before proceeding.
+- Alternative iter 19 candidate if M3 scaffold shows no structural promise: **M5 βK precompute** — at chunk entry, cooperatively pre-multiply `βk[tid] = β · k[tid]` into SMEM. Consumed by `state_vec += βk · (v − γ·kS)`. Saves one 4-wide scalar multiply in the hot loop, but adds a 64-token × 128-channel SMEM footprint (64 KiB) or requires a row-tile co-sharing scheme.
+- Reminder: if two consecutive M-steps fail to buy ≥5%, pivot to Phase 3 (wgmma/TMA) — Phase-2 SIMT has a fundamental ceiling around current latency without tensor cores.
+
+### Iteration 19 — M3+M1a: γ_cum LUT + log-space state_norm accumulator  → REVERT (INCORRECT_NUMERICAL on 5/30)
+- Change: at each chunk entry, the 64 threads compute `log_gate = -a_log_exp · softplus(x)` and `β` for their assigned token, then do a 2-warp inclusive prefix sum on `log_gate` (intra-warp `__shfl_up_sync` butterfly + a single `__syncthreads()` to hand warp-0's total to warp-1). SMEM exposes `sh_gamma_cum[i] = Γ_cum_local[i]`, `sh_inv_gamma_cum[i] = 1/Γ_cum_local[i]`, `sh_beta[i]`. The hot loop carries `state_norm = state / Γ_cum_local` and updates it as `state_norm += k · ξ` (no gate multiply). At chunk exit, `state_vec = Γ_cum_local[C−1] · state_norm`. Output is reconstructed as `out[i] = Γ_cum_local[i] · (qSnorm + qk·ξ)`.
+- Algebraic check (verified): identical to the original `state[t]=gate·state[t−1]+k·diff`, `out[t]=gate·qS+qk·diff` recurrence. Saves ~3 mul/token (removes the 4-channel `gate·state` multiply from the state update) and the per-chunk rescale costs 4 mul amortized over the whole chunk — big theoretical win (~10-15%).
+- Results: **25/30 PASSED, 5/30 INCORRECT_NUMERICAL | worst abs err: inf | worst rel err: inf | avg latency: 0.340 ms** (but this avg is contaminated by the failing workloads; correct-case latency was not reported separately).
+- Failing workloads: `c5257f65, 1b441950, fc7a2bcb, 3a77dfec, 43bf9699`.
+- Root cause: **fp32 underflow of Γ_cum_local** on long chunks with small-gate workloads. When `Γ_cum_local → 0` (cum_log < −80 or so), `inv_gamma = expf(-cum_log) → +∞`, and `xi = β·(v·inv_gamma − kSnorm)` becomes ±Inf, propagating to `state_norm` and ultimately to `out`. The log-space state formulation is only safe when `|cum_log|` stays within the fp32 expf-representable range (~(-87, 88)) across the chunk. For typical gates close to 1 this is fine; for workloads with occasional tiny gates it fails catastrophically. The `2.97e-01` worst rel err on the baseline already suggested the reference kernel lives near the edge of fp32 headroom in some workloads.
+- Decision: **REVERT** — restored from `/tmp/kernel.cu.bak_before_iter19`, repacked `solution_cuda.json`. Kernel is back at the iter-18 state = **0.265 ms, 30/30 PASSED**.
+- Lesson: any log-space factorization (M1/M1a) needs an in-chunk rescaling mechanism (renormalize `state_norm` back to absolute when `|cum_log|` grows too large) OR needs to be kept in absolute state form. `kChunkSize=64` is too large for the worst-case workloads — even `kChunkSize=8` can underflow with gate ≈ 1e-10 occurrences. Log-space state is structurally incompatible with this workload's numeric range.
+
+### NEXT ACTION (post iter 19)
+- Do **not** pursue any pure log-space state reformulation; it is fundamentally unsafe here.
+- Remaining Phase-2 paths that keep state in absolute form are structurally much harder (B1 WY compact form requires a chunk-local C×C triangular solve; M5 βK precompute saves only ~1 mul/token and trades for SMEM pressure). Given the failure mode of iter 19 confirms the hot loop is already riding fp32 precision edges, bigger per-token arithmetic changes carry correctness risk.
+- Per the opt_log §Measurement strategy clause: "abort-and-pivot to Phase 3 (wgmma) if two consecutive M-steps fail to buy ≥5%." Iter 19 counts as one such failure. **Pause at 0.265 ms / 30/30 PASSED** and surface the Phase-2-vs-Phase-3 pivot to the user before burning another Modal run.
+
 ### New measurement recipe (going forward)
 - Env: `conda fi-bench` env is empty of packages; the working one is the pyenv 3.12.13 `fi-bench` *or* conda's `fi-bench` accessed via absolute path with `KMP_DUPLICATE_LIB_OK=TRUE`.
 - Pack: `KMP_DUPLICATE_LIB_OK=TRUE /opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/python scripts/pack_cuda_solution.py`
@@ -247,12 +314,12 @@ Phase 1 (≤ 0.150 ms, low-risk baseline tuning):
 - [ ] E4: `__ldcs` streaming hint on Q/K/V
 - [ ] E6: SMEM carveout 100 %
 - [ ] F3: batch gate/beta load into registers per warp
-- [ ] G1: fuse compute_gate_beta_kernel into main kernel
+- [x] G1: fuse compute_gate_beta_kernel into main kernel  — **iter 18 KEEP (−0.003 ms, −1.1%)**, chunked cooperative variant
 - [ ] H1: try 4 warps/block with kRowsPerBlock=4
 - [ ] H2: retune `__launch_bounds__`
 
 Phase 2 (≤ 0.125 ms, chunkwise rewrite):
-- [ ] A1+A3: grid `(v_head, num_chunks)`, templated CHUNK_SIZE
+- [~] A1+A3: grid `(v_head, num_chunks)` + templated CHUNK_SIZE  — **B1a scaffold landed in iter 17** (per-sequence outer chunk loop, `kChunkSize=64`, SMEM `sh_gate_beta`); true per-chunk grid still TBD
 - [ ] B1: WY compact form (SIMT)
 - [ ] M1: γ_intra factorization via γ_cum
 - [ ] M2: `(Q K^T) U` ordering

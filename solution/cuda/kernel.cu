@@ -21,6 +21,7 @@ constexpr int kWarpsPerBlock = 2;
 constexpr int kRowsPerBlock = kWarpsPerBlock;
 constexpr int kThreads = kWarpsPerBlock * kWarpSize;
 constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
+constexpr int kChunkSize = 64;
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -82,39 +83,16 @@ __device__ __forceinline__ float warp_broadcast_0(float value) {
   return __shfl_sync(0xffffffffu, value, 0);
 }
 
-__global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
-    const float* __restrict__ A_log,
-    const c10::BFloat16* __restrict__ a,
-    const float* __restrict__ dt_bias,
-    const c10::BFloat16* __restrict__ b,
-    float2* __restrict__ gate_beta,
-    int total_seq_len) {
-  __builtin_assume(blockDim.x == 256);
-  __builtin_assume(total_seq_len > 0);
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = total_seq_len * kNumVHeads;
-  if (idx >= total) {
-    return;
-  }
-
-  int head_idx = idx % kNumVHeads;
-  __builtin_assume(head_idx >= 0 && head_idx < kNumVHeads);
-  float a_val = bf16_to_float(a + idx);
-  float b_val = bf16_to_float(b + idx);
-  float x = a_val + dt_bias[head_idx];
-  float a_log_exp = expf(A_log[head_idx]);
-  gate_beta[idx] = make_float2(
-      expf(-a_log_exp * softplusf_stable(x)),
-      1.0f / (1.0f + expf(-b_val)));
-}
-
 __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     const c10::BFloat16* __restrict__ q,
     const c10::BFloat16* __restrict__ k,
     const c10::BFloat16* __restrict__ v,
     const float* __restrict__ state_in,
     float* __restrict__ state_out,
-    const float2* __restrict__ gate_beta,
+    const float* __restrict__ A_log,
+    const c10::BFloat16* __restrict__ a,
+    const float* __restrict__ dt_bias,
+    const c10::BFloat16* __restrict__ b,
     const int64_t* __restrict__ cu_seqlens,
     c10::BFloat16* __restrict__ output,
     int64_t num_seqs,
@@ -156,48 +134,64 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     state_vec = make_float4(0.f, 0.f, 0.f, 0.f);
   }
 
-  #pragma unroll 12
-  for (int64_t t = seq_start; t < seq_end; ++t) {
-    const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
-    const int64_t k_offset = ((t * kNumKHeads + k_head_idx) * kHeadSize) + col_base;
-    const int64_t v_offset = ((t * kNumVHeads + head_idx) * kHeadSize) + row_idx;
+  // G1 fusion: preload per-head constants once per block; at each chunk entry
+  // the 64 threads cooperatively compute gate/β for the chunk's tokens into SMEM.
+  // Replaces the separate compute_gate_beta_kernel + global gate_beta roundtrip.
+  const float a_log_exp = expf(A_log[head_idx]);
+  const float dt_bias_h = dt_bias[head_idx];
 
-    const float4 q_vec = load_bf16x4(q + q_offset);
-    const float4 k_vec = load_bf16x4(k + k_offset);
+  __shared__ float2 sh_gate_beta[kChunkSize];
 
-    float gate_l = 0.0f, beta_l = 0.0f, v_l = 0.0f;
-    if (lane_idx == 0) {
-      const float2 gate_beta_vec = gate_beta[t * kNumVHeads + head_idx];
-      gate_l = gate_beta_vec.x;
-      beta_l = gate_beta_vec.y;
-      v_l = bf16_to_float(v + v_offset);
+  for (int64_t chunk_start = seq_start; chunk_start < seq_end; chunk_start += kChunkSize) {
+    const int chunk_rem = static_cast<int>(seq_end - chunk_start);
+    const int C_actual = chunk_rem < kChunkSize ? chunk_rem : kChunkSize;
+
+    if (threadIdx.x < C_actual) {
+      const int64_t t_tok = chunk_start + threadIdx.x;
+      const int64_t ab_offset = t_tok * kNumVHeads + head_idx;
+      const float a_val = bf16_to_float(a + ab_offset);
+      const float b_val = bf16_to_float(b + ab_offset);
+      const float gate = expf(-a_log_exp * softplusf_stable(a_val + dt_bias_h));
+      const float beta = 1.0f / (1.0f + expf(-b_val));
+      sh_gate_beta[threadIdx.x] = make_float2(gate, beta);
     }
-    const float gate = warp_broadcast_0(gate_l);
-    const float beta = warp_broadcast_0(beta_l);
-    const float v_val = warp_broadcast_0(v_l);
+    __syncthreads();
 
-    // Three pre-update partial dots (lane-local). All depend only on
-    // q_vec, k_vec, and the pre-update state_vec — independent of each other.
-    const float p_kS = dot_float4(k_vec, state_vec);
-    const float p_qS = dot_float4(q_vec, state_vec);
-    const float p_qk = dot_float4(q_vec, k_vec);
-    const float kS = warp_sum_all(p_kS);
-    const float qS = warp_sum_all(p_qS);
-    const float qk = warp_sum_all(p_qk);
+    #pragma unroll 8
+    for (int i = 0; i < C_actual; ++i) {
+      const int64_t t = chunk_start + i;
+      const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
+      const int64_t k_offset = ((t * kNumKHeads + k_head_idx) * kHeadSize) + col_base;
+      const int64_t v_offset = ((t * kNumVHeads + head_idx) * kHeadSize) + row_idx;
 
-    // Algebraic out: o = <q, γ·state_old + k·diff> = γ·qS + qk·diff
-    // (no dependency on the updated state_vec — store can race state update)
-    const float diff = beta * (v_val - gate * kS);
-    const float out = gate * qS + qk * diff;
+      const float4 q_vec = load_bf16x4(q + q_offset);
+      const float4 k_vec = load_bf16x4(k + k_offset);
 
-    state_vec.x = fmaf(k_vec.x, diff, gate * state_vec.x);
-    state_vec.y = fmaf(k_vec.y, diff, gate * state_vec.y);
-    state_vec.z = fmaf(k_vec.z, diff, gate * state_vec.z);
-    state_vec.w = fmaf(k_vec.w, diff, gate * state_vec.w);
+      const float2 gate_beta_vec = sh_gate_beta[i];
+      const float gate = gate_beta_vec.x;
+      const float beta = gate_beta_vec.y;
+      const float v_val = bf16_to_float(v + v_offset);
 
-    if (lane_idx == 0) {
-      float_to_bf16(scale_f * out, output + v_offset);
+      const float p_kS = dot_float4(k_vec, state_vec);
+      const float p_qS = dot_float4(q_vec, state_vec);
+      const float p_qk = dot_float4(q_vec, k_vec);
+      const float kS = warp_sum_all(p_kS);
+      const float qS = warp_sum_all(p_qS);
+      const float qk = warp_sum_all(p_qk);
+
+      const float diff = beta * (v_val - gate * kS);
+      const float out = gate * qS + qk * diff;
+
+      state_vec.x = fmaf(k_vec.x, diff, gate * state_vec.x);
+      state_vec.y = fmaf(k_vec.y, diff, gate * state_vec.y);
+      state_vec.z = fmaf(k_vec.z, diff, gate * state_vec.z);
+      state_vec.w = fmaf(k_vec.w, diff, gate * state_vec.w);
+
+      if (lane_idx == 0) {
+        float_to_bf16(scale_f * out, output + v_offset);
+      }
     }
+    __syncthreads();
   }
 
   reinterpret_cast<float4*>(state_out + state_offset)[0] = state_vec;
@@ -280,9 +274,6 @@ void gdn_prefill_cuda(
   }
 
   const int64_t num_seqs = cu_seqlens.numel() - 1;
-  auto gate_beta = torch::empty(
-      {q.size(0), kNumVHeads, 2},
-      torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
 
   if (has_state) {
     TORCH_CHECK(
@@ -304,17 +295,6 @@ void gdn_prefill_cuda(
   const dim3 block(kThreads, 1, 1);
 
   auto stream = c10::cuda::getDefaultCUDAStream();
-  const int total_gate_elems = static_cast<int>(q.size(0) * kNumVHeads);
-  const int pre_threads = 256;
-  const int pre_blocks = (total_gate_elems + pre_threads - 1) / pre_threads;
-  compute_gate_beta_kernel<<<pre_blocks, pre_threads, 0, stream.stream()>>>(
-      A_log.data_ptr<float>(),
-      a.data_ptr<c10::BFloat16>(),
-      dt_bias.data_ptr<float>(),
-      b.data_ptr<c10::BFloat16>(),
-      reinterpret_cast<float2*>(gate_beta.data_ptr<float>()),
-      static_cast<int>(q.size(0)));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   gdn_prefill_kernel<<<grid, block, 0, stream.stream()>>>(
       q.data_ptr<c10::BFloat16>(),
@@ -322,7 +302,10 @@ void gdn_prefill_cuda(
       v.data_ptr<c10::BFloat16>(),
       has_state ? state_in.data_ptr<float>() : nullptr,
       new_state.data_ptr<float>(),
-      reinterpret_cast<const float2*>(gate_beta.data_ptr<float>()),
+      A_log.data_ptr<float>(),
+      a.data_ptr<c10::BFloat16>(),
+      dt_bias.data_ptr<float>(),
+      b.data_ptr<c10::BFloat16>(),
       cu_seqlens.data_ptr<int64_t>(),
       output.data_ptr<c10::BFloat16>(),
       num_seqs,
