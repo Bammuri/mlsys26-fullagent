@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -67,6 +68,16 @@ __device__ __forceinline__ float warp_sum(float value) {
   return value;
 }
 
+// All-lane butterfly reduction — result is identical in every lane,
+// so callers don't need a follow-up broadcast shuffle.
+__device__ __forceinline__ float warp_sum_all(float value) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
 __device__ __forceinline__ float warp_broadcast_0(float value) {
   return __shfl_sync(0xffffffffu, value, 0);
 }
@@ -78,6 +89,8 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
     const c10::BFloat16* __restrict__ b,
     float2* __restrict__ gate_beta,
     int total_seq_len) {
+  __builtin_assume(blockDim.x == 256);
+  __builtin_assume(total_seq_len > 0);
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = total_seq_len * kNumVHeads;
   if (idx >= total) {
@@ -85,6 +98,7 @@ __global__ __launch_bounds__(256, 2) void compute_gate_beta_kernel(
   }
 
   int head_idx = idx % kNumVHeads;
+  __builtin_assume(head_idx >= 0 && head_idx < kNumVHeads);
   float a_val = bf16_to_float(a + idx);
   float b_val = bf16_to_float(b + idx);
   float x = a_val + dt_bias[head_idx];
@@ -106,6 +120,8 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     int64_t num_seqs,
     double scale,
     bool has_state) {
+  __builtin_assume(blockDim.x == kThreads);
+  __builtin_assume(num_seqs > 0);
   const int seq_idx = blockIdx.y;
   const int head_idx = blockIdx.x / kRowTilesPerHead;
   const int row_tile_idx = blockIdx.x % kRowTilesPerHead;
@@ -116,6 +132,11 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
   if (seq_idx >= num_seqs || head_idx >= kNumVHeads || row_idx >= kHeadSize) {
     return;
   }
+  __builtin_assume(seq_idx >= 0 && seq_idx < num_seqs);
+  __builtin_assume(head_idx >= 0 && head_idx < kNumVHeads);
+  __builtin_assume(row_idx >= 0 && row_idx < kHeadSize);
+  __builtin_assume(lane_idx >= 0 && lane_idx < kWarpSize);
+  __builtin_assume(warp_idx >= 0 && warp_idx < kWarpsPerBlock);
 
   const int col_base = lane_idx * kVecSize;
   const int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
@@ -123,6 +144,7 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
   const float scale_f = static_cast<float>(scale);
   const int64_t seq_start = cu_seqlens[seq_idx];
   const int64_t seq_end = cu_seqlens[seq_idx + 1];
+  __builtin_assume(seq_end >= seq_start);
   const int64_t state_offset =
       (((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + row_idx) * kHeadSize +
        col_base);
@@ -134,6 +156,7 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     state_vec = make_float4(0.f, 0.f, 0.f, 0.f);
   }
 
+  #pragma unroll 16
   for (int64_t t = seq_start; t < seq_end; ++t) {
     const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
     const int64_t k_offset = ((t * kNumKHeads + k_head_idx) * kHeadSize) + col_base;
@@ -142,32 +165,36 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     const float4 q_vec = load_bf16x4(q + q_offset);
     const float4 k_vec = load_bf16x4(k + k_offset);
 
-    float gate = 0.0f;
-    float beta = 0.0f;
+    float gate_l = 0.0f, beta_l = 0.0f, v_l = 0.0f;
     if (lane_idx == 0) {
       const float2 gate_beta_vec = gate_beta[t * kNumVHeads + head_idx];
-      gate = gate_beta_vec.x;
-      beta = gate_beta_vec.y;
+      gate_l = gate_beta_vec.x;
+      beta_l = gate_beta_vec.y;
+      v_l = bf16_to_float(v + v_offset);
     }
-    gate = warp_broadcast_0(gate);
-    beta = warp_broadcast_0(beta);
+    const float gate = warp_broadcast_0(gate_l);
+    const float beta = warp_broadcast_0(beta_l);
+    const float v_val = warp_broadcast_0(v_l);
 
-    float old_v = warp_sum(dot_float4(k_vec, state_vec));
-    old_v = gate * warp_broadcast_0(old_v);
+    // Three pre-update partial dots (lane-local). All depend only on
+    // q_vec, k_vec, and the pre-update state_vec — independent of each other.
+    const float p_kS = dot_float4(k_vec, state_vec);
+    const float p_qS = dot_float4(q_vec, state_vec);
+    const float p_qk = dot_float4(q_vec, k_vec);
+    const float kS = warp_sum_all(p_kS);
+    const float qS = warp_sum_all(p_qS);
+    const float qk = warp_sum_all(p_qk);
 
-    float v_val = 0.0f;
-    if (lane_idx == 0) {
-      v_val = bf16_to_float(v + v_offset);
-    }
-    v_val = warp_broadcast_0(v_val);
+    // Algebraic out: o = <q, γ·state_old + k·diff> = γ·qS + qk·diff
+    // (no dependency on the updated state_vec — store can race state update)
+    const float diff = beta * (v_val - gate * kS);
+    const float out = gate * qS + qk * diff;
 
-    const float diff = beta * (v_val - old_v);
     state_vec.x = fmaf(k_vec.x, diff, gate * state_vec.x);
     state_vec.y = fmaf(k_vec.y, diff, gate * state_vec.y);
     state_vec.z = fmaf(k_vec.z, diff, gate * state_vec.z);
     state_vec.w = fmaf(k_vec.w, diff, gate * state_vec.w);
 
-    float out = warp_sum(dot_float4(q_vec, state_vec));
     if (lane_idx == 0) {
       float_to_bf16(scale_f * out, output + v_offset);
     }
