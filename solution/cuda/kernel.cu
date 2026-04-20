@@ -21,7 +21,11 @@ constexpr int kWarpsPerBlock = 2;
 constexpr int kRowsPerBlock = kWarpsPerBlock;
 constexpr int kThreads = kWarpsPerBlock * kWarpSize;
 constexpr int kRowTilesPerHead = kHeadSize / kRowsPerBlock;
-constexpr int kChunkSize = 64;
+constexpr int kChunkSize = 256;
+// Head-pair fusion: each block handles kVHeadsPerBlock v_heads sharing the
+// same q_head + k_head (V_PER_Q == V_PER_K == 2 for this workload).
+constexpr int kVHeadsPerBlock = kNumVHeads / kNumQHeads;          // = 2
+constexpr int kHeadPairs       = kNumVHeads / kVHeadsPerBlock;    // = 4
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -101,100 +105,150 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
   __builtin_assume(blockDim.x == kThreads);
   __builtin_assume(num_seqs > 0);
   const int seq_idx = blockIdx.y;
-  const int head_idx = blockIdx.x / kRowTilesPerHead;
+  const int head_pair_idx = blockIdx.x / kRowTilesPerHead;
   const int row_tile_idx = blockIdx.x % kRowTilesPerHead;
   const int warp_idx = threadIdx.x / kWarpSize;
   const int lane_idx = threadIdx.x % kWarpSize;
   const int row_idx = row_tile_idx * kRowsPerBlock + warp_idx;
 
-  if (seq_idx >= num_seqs || head_idx >= kNumVHeads || row_idx >= kHeadSize) {
+  if (seq_idx >= num_seqs || head_pair_idx >= kHeadPairs || row_idx >= kHeadSize) {
     return;
   }
   __builtin_assume(seq_idx >= 0 && seq_idx < num_seqs);
-  __builtin_assume(head_idx >= 0 && head_idx < kNumVHeads);
+  __builtin_assume(head_pair_idx >= 0 && head_pair_idx < kHeadPairs);
   __builtin_assume(row_idx >= 0 && row_idx < kHeadSize);
   __builtin_assume(lane_idx >= 0 && lane_idx < kWarpSize);
   __builtin_assume(warp_idx >= 0 && warp_idx < kWarpsPerBlock);
 
+  const int v_head_a = head_pair_idx * kVHeadsPerBlock;
+  const int v_head_b = v_head_a + 1;
+  // V_PER_Q = V_PER_K = kVHeadsPerBlock => head_pair_idx is exactly q_head/k_head.
+  const int q_head_idx = head_pair_idx;
+  const int k_head_idx = head_pair_idx;
+
   const int col_base = lane_idx * kVecSize;
-  const int q_head_idx = head_idx / (kNumVHeads / kNumQHeads);
-  const int k_head_idx = head_idx / (kNumVHeads / kNumKHeads);
   const float scale_f = static_cast<float>(scale);
   const int64_t seq_start = cu_seqlens[seq_idx];
   const int64_t seq_end = cu_seqlens[seq_idx + 1];
   __builtin_assume(seq_end >= seq_start);
-  const int64_t state_offset =
-      (((static_cast<int64_t>(seq_idx) * kNumVHeads + head_idx) * kHeadSize + row_idx) * kHeadSize +
+
+  const int64_t state_offset_a =
+      (((static_cast<int64_t>(seq_idx) * kNumVHeads + v_head_a) * kHeadSize + row_idx) *
+           kHeadSize +
+       col_base);
+  const int64_t state_offset_b =
+      (((static_cast<int64_t>(seq_idx) * kNumVHeads + v_head_b) * kHeadSize + row_idx) *
+           kHeadSize +
        col_base);
 
-  float4 state_vec;
+  float4 state_vec_a;
+  float4 state_vec_b;
   if (has_state) {
-    state_vec = reinterpret_cast<const float4*>(state_in + state_offset)[0];
+    state_vec_a = reinterpret_cast<const float4*>(state_in + state_offset_a)[0];
+    state_vec_b = reinterpret_cast<const float4*>(state_in + state_offset_b)[0];
   } else {
-    state_vec = make_float4(0.f, 0.f, 0.f, 0.f);
+    state_vec_a = make_float4(0.f, 0.f, 0.f, 0.f);
+    state_vec_b = make_float4(0.f, 0.f, 0.f, 0.f);
   }
 
-  // G1 fusion: preload per-head constants once per block; at each chunk entry
-  // the 64 threads cooperatively compute gate/β for the chunk's tokens into SMEM.
-  // Replaces the separate compute_gate_beta_kernel + global gate_beta roundtrip.
-  const float a_log_exp = expf(A_log[head_idx]);
-  const float dt_bias_h = dt_bias[head_idx];
+  // G1 fusion: per-head constants for both v_heads in the pair, preloaded once per block.
+  const float a_log_exp_a = expf(A_log[v_head_a]);
+  const float dt_bias_a   = dt_bias[v_head_a];
+  const float a_log_exp_b = expf(A_log[v_head_b]);
+  const float dt_bias_b   = dt_bias[v_head_b];
 
-  __shared__ float2 sh_gate_beta[kChunkSize];
+  __shared__ float2 sh_gate_beta_a[kChunkSize];
+  __shared__ float2 sh_gate_beta_b[kChunkSize];
 
   for (int64_t chunk_start = seq_start; chunk_start < seq_end; chunk_start += kChunkSize) {
     const int chunk_rem = static_cast<int>(seq_end - chunk_start);
     const int C_actual = chunk_rem < kChunkSize ? chunk_rem : kChunkSize;
 
-    if (threadIdx.x < C_actual) {
-      const int64_t t_tok = chunk_start + threadIdx.x;
-      const int64_t ab_offset = t_tok * kNumVHeads + head_idx;
-      const float a_val = bf16_to_float(a + ab_offset);
-      const float b_val = bf16_to_float(b + ab_offset);
-      const float gate = expf(-a_log_exp * softplusf_stable(a_val + dt_bias_h));
-      const float beta = 1.0f / (1.0f + expf(-b_val));
-      sh_gate_beta[threadIdx.x] = make_float2(gate, beta);
+    // Cooperative gate/β load for both v_heads. Total slots = 2*C_actual; threads = 64.
+    // Pack as: slots [0, C_actual)  -> v_head_a, slots [C_actual, 2*C_actual) -> v_head_b.
+    const int total_slots = 2 * C_actual;
+    #pragma unroll
+    for (int slot_base = 0; slot_base < 2 * kChunkSize; slot_base += kThreads) {
+      const int slot = slot_base + threadIdx.x;
+      if (slot < total_slots) {
+        const bool is_b = slot >= C_actual;
+        const int local_i = is_b ? (slot - C_actual) : slot;
+        const int v_head = is_b ? v_head_b : v_head_a;
+        const float a_log_exp_h = is_b ? a_log_exp_b : a_log_exp_a;
+        const float dt_bias_h   = is_b ? dt_bias_b   : dt_bias_a;
+        const int64_t t_tok = chunk_start + local_i;
+        const int64_t ab_offset = t_tok * kNumVHeads + v_head;
+        const float a_val = bf16_to_float(a + ab_offset);
+        const float b_val = bf16_to_float(b + ab_offset);
+        const float gate = expf(-a_log_exp_h * softplusf_stable(a_val + dt_bias_h));
+        const float beta = 1.0f / (1.0f + expf(-b_val));
+        const float2 packed = make_float2(gate, beta);
+        if (is_b) {
+          sh_gate_beta_b[local_i] = packed;
+        } else {
+          sh_gate_beta_a[local_i] = packed;
+        }
+      }
     }
     __syncthreads();
 
-    #pragma unroll 8
+    #pragma unroll 4
     for (int i = 0; i < C_actual; ++i) {
       const int64_t t = chunk_start + i;
       const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
       const int64_t k_offset = ((t * kNumKHeads + k_head_idx) * kHeadSize) + col_base;
-      const int64_t v_offset = ((t * kNumVHeads + head_idx) * kHeadSize) + row_idx;
+      const int64_t v_offset_a = ((t * kNumVHeads + v_head_a) * kHeadSize) + row_idx;
+      const int64_t v_offset_b = v_offset_a + kHeadSize;  // contiguous v_head_b right after v_head_a
 
       const float4 q_vec = load_bf16x4(q + q_offset);
       const float4 k_vec = load_bf16x4(k + k_offset);
 
-      const float2 gate_beta_vec = sh_gate_beta[i];
-      const float gate = gate_beta_vec.x;
-      const float beta = gate_beta_vec.y;
-      const float v_val = bf16_to_float(v + v_offset);
+      const float2 gb_a = sh_gate_beta_a[i];
+      const float2 gb_b = sh_gate_beta_b[i];
+      const float gate_a = gb_a.x;
+      const float beta_a = gb_a.y;
+      const float gate_b = gb_b.x;
+      const float beta_b = gb_b.y;
+      const float v_val_a = bf16_to_float(v + v_offset_a);
+      const float v_val_b = bf16_to_float(v + v_offset_b);
 
-      const float p_kS = dot_float4(k_vec, state_vec);
-      const float p_qS = dot_float4(q_vec, state_vec);
+      const float p_kS_a = dot_float4(k_vec, state_vec_a);
+      const float p_qS_a = dot_float4(q_vec, state_vec_a);
+      const float p_kS_b = dot_float4(k_vec, state_vec_b);
+      const float p_qS_b = dot_float4(q_vec, state_vec_b);
       const float p_qk = dot_float4(q_vec, k_vec);
-      const float kS = warp_sum_all(p_kS);
-      const float qS = warp_sum_all(p_qS);
+
+      const float kS_a = warp_sum_all(p_kS_a);
+      const float qS_a = warp_sum_all(p_qS_a);
+      const float kS_b = warp_sum_all(p_kS_b);
+      const float qS_b = warp_sum_all(p_qS_b);
       const float qk = warp_sum_all(p_qk);
 
-      const float diff = beta * (v_val - gate * kS);
-      const float out = gate * qS + qk * diff;
+      const float diff_a = beta_a * (v_val_a - gate_a * kS_a);
+      const float diff_b = beta_b * (v_val_b - gate_b * kS_b);
+      const float out_a = gate_a * qS_a + qk * diff_a;
+      const float out_b = gate_b * qS_b + qk * diff_b;
 
-      state_vec.x = fmaf(k_vec.x, diff, gate * state_vec.x);
-      state_vec.y = fmaf(k_vec.y, diff, gate * state_vec.y);
-      state_vec.z = fmaf(k_vec.z, diff, gate * state_vec.z);
-      state_vec.w = fmaf(k_vec.w, diff, gate * state_vec.w);
+      state_vec_a.x = fmaf(k_vec.x, diff_a, gate_a * state_vec_a.x);
+      state_vec_a.y = fmaf(k_vec.y, diff_a, gate_a * state_vec_a.y);
+      state_vec_a.z = fmaf(k_vec.z, diff_a, gate_a * state_vec_a.z);
+      state_vec_a.w = fmaf(k_vec.w, diff_a, gate_a * state_vec_a.w);
+
+      state_vec_b.x = fmaf(k_vec.x, diff_b, gate_b * state_vec_b.x);
+      state_vec_b.y = fmaf(k_vec.y, diff_b, gate_b * state_vec_b.y);
+      state_vec_b.z = fmaf(k_vec.z, diff_b, gate_b * state_vec_b.z);
+      state_vec_b.w = fmaf(k_vec.w, diff_b, gate_b * state_vec_b.w);
 
       if (lane_idx == 0) {
-        float_to_bf16(scale_f * out, output + v_offset);
+        float_to_bf16(scale_f * out_a, output + v_offset_a);
+        float_to_bf16(scale_f * out_b, output + v_offset_b);
       }
     }
     __syncthreads();
   }
 
-  reinterpret_cast<float4*>(state_out + state_offset)[0] = state_vec;
+  reinterpret_cast<float4*>(state_out + state_offset_a)[0] = state_vec_a;
+  reinterpret_cast<float4*>(state_out + state_offset_b)[0] = state_vec_b;
 }
 
 }  // namespace
@@ -291,7 +345,7 @@ void gdn_prefill_cuda(
   TORCH_CHECK(output.device() == q.device(), "output must be on the same device as q");
   TORCH_CHECK(new_state.device() == q.device(), "new_state must be on the same device as q");
 
-  const dim3 grid(kNumVHeads * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
+  const dim3 grid(kHeadPairs * kRowTilesPerHead, static_cast<unsigned int>(num_seqs), 1);
   const dim3 block(kThreads, 1, 1);
 
   auto stream = c10::cuda::getDefaultCUDAStream();

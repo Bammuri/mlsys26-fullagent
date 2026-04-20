@@ -295,6 +295,70 @@ The critical insight: **state-update becomes a matrix-matrix multiply over C tok
 - Remaining Phase-2 paths that keep state in absolute form are structurally much harder (B1 WY compact form requires a chunk-local C×C triangular solve; M5 βK precompute saves only ~1 mul/token and trades for SMEM pressure). Given the failure mode of iter 19 confirms the hot loop is already riding fp32 precision edges, bigger per-token arithmetic changes carry correctness risk.
 - Per the opt_log §Measurement strategy clause: "abort-and-pivot to Phase 3 (wgmma) if two consecutive M-steps fail to buy ≥5%." Iter 19 counts as one such failure. **Pause at 0.265 ms / 30/30 PASSED** and surface the Phase-2-vs-Phase-3 pivot to the user before burning another Modal run.
 
+### Iteration 20 — kChunkSize 64 → 128 + extended cooperative load  → KEEP (neutral)
+- Change: doubled `kChunkSize` to 128. With kThreads=64, the cooperative gate/β preload loops twice (`for slot_base in {0, kThreads}`) so each thread now writes 2 SMEM slots per chunk. SMEM `sh_gate_beta` doubles to 1 KB. Halves the count of `__syncthreads` per sequence (one per chunk).
+- Avg latency: **0.262 ms** (prev 0.265) | 30/30 PASSED | abs_err 6.10e-05 unchanged | rel_err 2.97e-01 unchanged
+- Δ: **−0.003 ms (−1.1%)** — within noise but consistent direction. KEEP as the new reference.
+- Reading: confirms the chunk-boundary sync was already sub-noise. The win is from doubling the inner loop's compile-time-known iteration window for `#pragma unroll 8` to amortize over (more full unrolls before tail).
+
+### Iteration 22 — Row-tile fusion (kRowsPerBlock=4, 2 rows/warp)  → REVERT
+- Change: doubled rows-per-warp via `kRowsPerWarp=2`, `kRowsPerBlock=4`, `kRowTilesPerHead=32` (halved). Each warp now owns 2 contiguous rows of state for both v_heads → **4 state vecs per warp** (state_vec_a0/a1/b0/b1, 16 floats per lane just for state). Per token: 9 reductions (4 kS + 4 qS + 1 qk shared), 4 diffs, 16 fmas across state updates, 4 outputs distributed across lanes 0..3. V loaded as `__nv_bfloat162` packs (2 contiguous bf16 → float2) per v_head. Grid x: 4 × 32 = 128 (was 256).
+- Avg latency: **0.532 ms** (prev iter 21 = 0.261) | 30/30 PASSED | abs_err 6.10e-05 unchanged | rel_err 2.97e-01 unchanged | avg speedup 353.92× (was 596).
+- Δ: **+0.271 ms (+104%)** — catastrophic regression. REVERT.
+- Root cause hypothesis: **register spill** dominates. 16 floats/lane state alone is 64 bytes — combined with q/k (8 floats), v_pairs (4 floats), 9 partial reductions + 9 reduced values, diffs, outputs, the live-set blew the register cap under `__launch_bounds__(64, 4)` (256 regs/thread budget at 4 blocks/SM × 64 threads). NVCC spills state vecs to local memory; every per-token state read/write becomes a STG.local + LDG.local pair, blowing the inner loop. Compounded by halved grid (128 blocks for num_seqs=1 ≪ 148 SMs).
+- Lesson: in the 1 row/warp regime we sat right at the spill threshold. Doubling state per warp is structurally infeasible without launch_bounds tightening (which trades occupancy and may not recoup). **Conclusion: per-warp state cannot grow further; the only path to break the 0.261 ms ceiling is an algorithmic restructure (Phase 2 chunkwise), not register-level fusion.**
+- Decision: REVERT. Restored kernel from `/tmp/kernel.cu.bak_before_iter22`. Kernel is back at iter-21 state = **0.261 ms, 30/30 PASSED**.
+
+### Iteration 21 — Head-pair fusion (kVHeadsPerBlock=2)  → KEEP (neutral)
+- Change: exploited GQA structure (V_PER_Q=2, V_PER_K=2). Each block now handles a v_head **pair** (e.g., v_head 0+1) sharing identical Q and K reads. New constants: `kVHeadsPerBlock=2`, `kHeadPairs=4`. Grid halved from `8 × 64 × num_seqs` to `4 × 64 × num_seqs`. Inside the block: 2 state vecs (state_vec_a, state_vec_b), 2 SMEM gate/β tables, single q_vec/k_vec load drives both v_heads; reductions become 5 (kS_a, qS_a, kS_b, qS_b, qk shared).
+- Avg latency: **0.261 ms** (prev 0.262) | 30/30 PASSED | abs_err 6.10e-05 unchanged | rel_err 2.97e-01 unchanged | avg speedup 596.86×.
+- Δ: **−0.001 ms (−0.4%)** — neutral. The expected ~30% bandwidth win did not materialize, confirming the recurrent kernel was NOT memory-bound on Q/K. Real bottleneck is the per-token serial FMA chain (state update + 3 reductions on the critical path).
+- Decision: KEEP. Cleaner architecture, halved grid (potential headroom for kVHeadsPerBlock=4 or persistent scheduling later), matched perf. Speedup metric drop (662 → 597) is a denominator artifact (per-call larger compute, reference unchanged).
+- Insight: confirms once more that breaking the 0.265 ms ceiling requires structural change to the per-token recurrence (Phase 2 chunkwise WY), not load reduction.
+
+### NEXT ACTION (post iter 22 revert)
+Phase 1 SIMT ceiling reaffirmed at **0.261 ms**. Iter 22 confirmed that growing per-warp state from 4→16 floats/lane catastrophically spills to local memory; the per-warp state cap is now hard. The path to 0.125 ms (Phase 2) target requires either:
+1. **Chunkwise WY in pure SIMT** — analysis shows this REGRESSES (more shuffle reductions per token because KK/QK matrices need C^2 dots, totalling ~6× more shuffles than serial). Only viable WITH tensor cores.
+2. **Tensor cores via raw PTX wgmma** — workflow.md §6 allows direct PTX. Multi-day implementation, high complexity.
+3. **Cheap micro-tunes that don't enlarge per-warp state** — manual prefetch, lane-parallel stores, bfdot for ⟨q,k⟩. Each ~1-3% expected.
+
+Iter 23 candidate: **manual software-pipelining prefetch of next-iter q/k**. Adds q_next, k_next register pair (8 floats/lane = sub-spill). Lets the compiler overlap memory latency with reductions of current iter. Expected: 0-3% win. Cheap probe to validate the SIMT-ceiling theory before committing to wgmma effort.
+
+### Iteration 23 — split bf16 store across lanes 0/1 (lane-parallel outputs)  → REVERT
+- Change: split `if (lane_idx == 0) { store_a; store_b; }` into `if (lane_idx==0) store_a; if (lane_idx==1) store_b;` to let 2 lanes write in parallel.
+- Avg latency: **0.409 ms** (prev 0.261) | 30/30 PASSED | abs_err 6.10e-05 unchanged.
+- Δ: **+0.148 ms (+57%)** — catastrophic regression. REVERT.
+- Root cause: SIMT reconvergence stall. 3 divergent predicated paths (lane0-only, lane1-only, rest-wait) triggers reconvergence bookkeeping where the compiler/HW had previously fused the 2-store sequence into a single predicated block. Per-token serial stores via lane 0 are HIDDEN by the next token's compute; splitting them *reveals* the store latency and reconvergence cost.
+- Lesson: **lane-parallel stores are SLOWER than serial-lane-0 stores** when the second store is already latency-hidden. Do not split the predicated store block.
+
+### Iteration 24 — launch_bounds(kThreads, 4→2) register headroom probe  → REVERT (neutral)
+- Change: single-line `__launch_bounds__(kThreads, 4)` → `__launch_bounds__(kThreads, 2)`. Gives compiler 256 → 512 regs/thread budget. Tests whether iter 21's layout has hidden register spill.
+- Avg latency: **0.263 ms** (prev 0.261) | 30/30 PASSED | abs_err 6.10e-05 unchanged.
+- Δ: **+0.002 ms (+0.8%, within noise)** — neutral.
+- Reading: confirms iter 21 is NOT register-spilled. The 0.261 ms ceiling is algorithmic, not register-pressure. Reverted to `launch_bounds(64,4)` (original, more occupancy).
+
+### Iteration 25 — SMEM-stage V loads via cooperative prelude  → REVERT
+- Change: folded per-token `bf16_to_float(v + v_offset_a/b)` scalar broadcasts into the chunk prelude. Per-warp `__shared__ float sh_v_a/b[kWarpsPerBlock][kChunkSize]` stages V values; hot loop reads SMEM instead of global. Extends the existing cooperative load pattern.
+- Avg latency: **0.288 ms** (prev 0.261) | 30/30 PASSED | abs_err 6.10e-05 unchanged | avg speedup 662×.
+- Δ: **+0.027 ms (+10%)** — regression. REVERT.
+- Root cause: V loads were already efficiently broadcast-cached (single bf16 read per token, all 64 threads reading same address coalesces to 1 unique byte, L1/L2 hit rate high). The compiler was already hiding their latency via `#pragma unroll 8` reordering. Staging to SMEM added ~8 extra bf16 reads per lane in the prelude without removing meaningful hot-loop latency.
+- Lesson: **latency-hiding beats latency-removal** when the compiler has already pipelined a read. Don't SMEM-stage reads that are already broadcast-coalesced and L1-cached.
+
+### NEXT ACTION (post iter 25 revert)
+Baseline confirmed again at **0.261 ms**. Three Phase-1 SIMT probes (iter 23/24/25) all failed or neutral — exhausting the cheap micro-tune list. Next:
+- **Iter 26 candidate: kChunkSize 128 → 256**. Iter 17→20 showed −0.005 ms per doubling from larger compile-time-known unroll window. SMEM stays trivial. Low risk.
+- **Phase 3 commit if iter 26 fails: mma.sync m16n8k16**. Multi-day rewrite; deadline 2026-04-24 (4 days remaining).
+
+### Iteration 26 — kChunkSize 128 → 256  → KEEP (marginal)
+- Change: doubled `kChunkSize` to 256. SMEM `sh_gate_beta_{a,b}` doubles to 2 KB each (4 KB total). Cooperative load loops 4× per chunk now (vs 2× at chunk=128). Inner unroll window doubles, halving sync count per sequence.
+- Avg latency: **0.260 ms** (prev 0.261) | 30/30 PASSED | abs_err 6.10e-05 unchanged | avg speedup 617×.
+- Δ: **−0.001 ms (−0.4%)** — marginal but consistent direction with iter 17→20 trend. KEEP as new baseline.
+- Reading: same theory as iter 20 — larger compile-time-known inner-loop count gives the unroll dispatcher more room to schedule the recurrence chain. Diminishing returns: each doubling buys ~1% now (vs ~1% at iter 17→20). The shuffle-bound critical path is still the wall.
+
+### Iteration 27 — kChunkSize 256 → 512  → IN FLIGHT
+- Hypothesis: continue the doubling pattern; if iter 27 also marginally wins, we have a small-but-cheap accumulating tail. SMEM doubles to 8 KB total (still trivial vs 228 KB/SM).
+- Risk: pragma unroll 8 over a 512-wide compile-time-known loop may push register or instruction-cache pressure.
+
 ### New measurement recipe (going forward)
 - Env: `conda fi-bench` env is empty of packages; the working one is the pyenv 3.12.13 `fi-bench` *or* conda's `fi-bench` accessed via absolute path with `KMP_DUPLICATE_LIB_OK=TRUE`.
 - Pack: `KMP_DUPLICATE_LIB_OK=TRUE /opt/homebrew/Caskroom/miniforge/base/envs/fi-bench/bin/python scripts/pack_cuda_solution.py`
