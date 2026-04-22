@@ -72,16 +72,29 @@ _SASS_DUMP_DIR = os.environ.get("MSINFER_SASS_DIR", "/tmp/cute-asm")
 if _DUMP_SASS:
     os.makedirs(_SASS_DUMP_DIR, exist_ok=True)
 
-_COMPILE_OPTS = (
+_REGCAP = os.environ.get("MSINFER_REGCAP", "")  # e.g. "128", "96", "80", "64"; "" = off
+
+_SASS_OPTS = (
+    f" --keep-ptx --keep-cubin --dump-dir={_SASS_DUMP_DIR} --ptxas-options=-v"
+    if _DUMP_SASS
+    else ""
+)
+
+_COMPILE_OPTS_BASE = (
     "--enable-tvm-ffi "
     "--gpu-arch=sm_100a "
     "--opt-level=3"
-    + (
-        f" --keep-ptx --keep-cubin --dump-dir={_SASS_DUMP_DIR} --ptxas-options=-v"
-        if _DUMP_SASS
-        else ""
-    )
+    + _SASS_OPTS
 )
+
+# High-B variant: optional register cap via --maxrregcount (top-level, passed to ptxas).
+_COMPILE_OPTS_HIGH = (
+    _COMPILE_OPTS_BASE
+    + (f" --maxrregcount={_REGCAP}" if _REGCAP else "")
+)
+
+# Low-B variant: no reg cap.
+_COMPILE_OPTS = _COMPILE_OPTS_BASE
 
 # Per-shape compiled-callable cache (thread-safe).
 _LOCK = threading.Lock()
@@ -349,25 +362,25 @@ def _wrap_cute(tensors):
     ]
 
 
-def _get_compiled(name: str, jit_fn, tensors):
-    key = (name,) + _cache_key(tensors)
+def _get_compiled(name: str, jit_fn, tensors, opts: str = _COMPILE_OPTS):
+    key = (name, opts) + _cache_key(tensors)
     with _LOCK:
         fn = _CACHE.get(key)
         if fn is None:
             cute_tensors = _wrap_cute(tensors)
-            fn = cute.compile(jit_fn, *cute_tensors, options=_COMPILE_OPTS)
+            fn = cute.compile(jit_fn, *cute_tensors, options=opts)
             _CACHE[key] = fn
     return fn
 
 
-def _dispatch(name, jit_fn, tensors, call_args):
+def _dispatch(name, jit_fn, tensors, call_args, opts: str = _COMPILE_OPTS):
     """Shared dispatch — catches and surfaces exceptions that the
     flashinfer-bench evaluator would otherwise swallow into RUNTIME_ERROR."""
     import sys
     import traceback
 
     try:
-        fn = _get_compiled(name, jit_fn, tensors)
+        fn = _get_compiled(name, jit_fn, tensors, opts)
         fn(*call_args)
     except Exception as e:
         print(f"[msinfer_entry:{name}] exception: {type(e).__name__}: {e}", flush=True)
@@ -383,7 +396,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     call_args = [q, k, v, state, A_log, a, dt_bias, b, output, new_state]
     B = q.shape[0]
     if B <= _LOW_B_MAX:
-        _dispatch("decode_low", _gdn_decode_jit_low, tensors, call_args)
+        _dispatch("decode_low", _gdn_decode_jit_low, tensors, call_args, _COMPILE_OPTS)
     else:
-        _dispatch("decode_high", _gdn_decode_jit, tensors, call_args)
+        _dispatch("decode_high", _gdn_decode_jit, tensors, call_args, _COMPILE_OPTS_HIGH)
 
