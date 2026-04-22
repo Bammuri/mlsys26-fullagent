@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-cute-decode-v5"                     # Solution name
+name = "gdn-cute-decode-v9"                     # Solution name
 definition = "gdn_decode_qk4_v8_d128_k_last"    # Benchmark definition name
 author = "team"                                 # Team/author name
 

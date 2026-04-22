@@ -46,15 +46,16 @@ kSplits_H       = 4
 kRowsPerBlock_H = D // kSplits_H   # 32
 kWarpThreads_H  = kRowsPerBlock_H  # 32
 
-# Low-B variant (B ≤ LOW_B_MAX): 8-way split, 16 threads per block.
-#   grid = (B * HV * 8, 1, 1); block = (16, 1, 1)
-#   Doubles grid size at low batch → more SMs active, ~2× throughput.
+# Low-B variant (B ≤ LOW_B_MAX): 8-way split, 32 threads per block, 2 threads per row.
+#   grid = (B * HV * 8, 1, 1); block = (32, 1, 1)
+#   2 threads collaborate on each state row → halves serial LDG chain per warp.
+#   Grid doubles at low batch → more SMs active. Full 32-thread warp → 100% efficiency.
 kSplits_L       = 8
-kRowsPerBlock_L = D // kSplits_L   # 16
-kWarpThreads_L  = kRowsPerBlock_L  # 16
+kRowsPerBlock_L = D // kSplits_L   # 16 rows per block
+kWarpThreads_L  = 32               # full warp; 2 threads per row
 
 # Dispatch threshold: use low variant for batch_size ≤ this value.
-_LOW_B_MAX = int(os.environ.get("MSINFER_LOW_B_MAX", "8"))
+_LOW_B_MAX = int(os.environ.get("MSINFER_LOW_B_MAX", "0"))
 
 # Keep aliases for backward compatibility in _gdn_decode_jit.
 kSplits       = kSplits_H
@@ -240,7 +241,14 @@ def _gdn_decode_dev_low(
     state_out: cute.Tensor,
     scale: cutlass.Constexpr[float],
 ):
-    """Low-B variant: kSplits=8, 16 threads/block → 2× grid at low batch."""
+    """Low-B variant: kSplits=8, 32 threads/block, 2 threads per state row.
+
+    Threads (2t) and (2t+1) collaborate on state row t:
+      - Each thread owns D/2 = 64 contiguous elements of the row.
+      - sr holds (D/2/4, 4) = (16, 4) fp32 — half the registers of high-B.
+      - After local ov/qs accum, one pairwise butterfly reduces within each pair.
+    Grid doubles at low batch (64 blocks at B=1 vs 32), exposing more SMs.
+    """
     bid_x, _, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
 
@@ -248,12 +256,15 @@ def _gdn_decode_dev_low(
     v_head  = (bid_x // kSplits_L) % HV
     batch   = bid_x // (kSplits_L * HV)
     qk_head = v_head // (HV // HQ)
-    row     = split * kRowsPerBlock_L + tid   # 0..127
+    row          = split * kRowsPerBlock_L + (tid // 2)   # 0..127
+    half         = tid % 2                                  # 0 or 1 (which D/2 half)
+    d_tile_start = half * (D // 8)                         # 0 or 16 (tile start, no div at runtime)
 
+    # Cooperative smem load — 32 lanes × 4 elements = 128 (same as high-B).
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
-    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 8
+    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 4
         idx = tid + j * kWarpThreads_L
         sQ[idx] = cutlass.Float32(q[batch, 0, qk_head, idx])
         sK[idx] = cutlass.Float32(k[batch, 0, qk_head, idx])
@@ -265,39 +276,70 @@ def _gdn_decode_dev_low(
 
     cute.arch.sync_warp()
 
-    # qk butterfly: only 4 levels (log2(16)=4) with mask_and_clamp=15.
+    # qk: full 32-thread butterfly — same 5 levels as high-B variant.
     qk = cutlass.Float32(0.0)
-    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 8
+    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 4
         idx = tid + j * kWarpThreads_L
         qk += sQ[idx] * sK[idx]
-    for offset in [8, 4, 2, 1]:
-        qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=15)
+    for offset in [16, 8, 4, 2, 1]:
+        qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
 
-    sr = cute.make_rmem_tensor(cute.make_layout((D // 4, 4), stride=(4, 1)), cutlass.Float32)
+    # Each thread handles its D/2 slice of state (16 tiles of 4 fp32).
+    # Using if/else so smem indices are compile-time constants (runtime smem
+    # indexing via a variable tile_idx is not reliably supported by the DSL).
+    sr = cute.make_rmem_tensor(cute.make_layout((D // 2 // 4, 4), stride=(4, 1)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
     ev_first = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
     ev_last  = cute.nvgpu.CacheEvictionPriority.EVICT_LAST
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
-    for i in cutlass.range_constexpr(D // 4):
-        state_tile = cute.local_tile(state_in, (1, 1, 1, 4), (batch, v_head, row, i))
-        cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
-        for c in cutlass.range_constexpr(4):
-            s = tmp[c] * g
-            sr[i, c] = s
-            ov += sK[i * 4 + c] * s
-            qs += sQ[i * 4 + c] * s
+    if half == 0:
+        # Tiles 0..15 — all indices constexpr within range_constexpr.
+        for i in cutlass.range_constexpr(D // 2 // 4):
+            state_tile = cute.local_tile(state_in, (1, 1, 1, 4), (batch, v_head, row, i))
+            cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
+            for c in cutlass.range_constexpr(4):
+                s = tmp[c] * g
+                sr[i, c] = s
+                ov += sK[i * 4 + c] * s
+                qs += sQ[i * 4 + c] * s
+    else:
+        # Tiles 16..31 — D//2//4 + i = 16 + i is constexpr since 16 is a Python constant.
+        for i in cutlass.range_constexpr(D // 2 // 4):
+            t = D // 2 // 4 + i   # 16 + i, fully constexpr
+            state_tile = cute.local_tile(state_in, (1, 1, 1, 4), (batch, v_head, row, t))
+            cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
+            for c in cutlass.range_constexpr(4):
+                s = tmp[c] * g
+                sr[i, c] = s
+                ov += sK[t * 4 + c] * s
+                qs += sQ[t * 4 + c] * s
+
+    # Pairwise reduce: threads (2t) and (2t+1) sum their partial ov/qs.
+    # mask_and_clamp=1 → XOR offset 1 within pairs: 0<->1, 2<->3, ..., 30<->31.
+    ov += cute.arch.shuffle_sync_bfly(ov, offset=1, mask=-1, mask_and_clamp=1)
+    qs += cute.arch.shuffle_sync_bfly(qs, offset=1, mask=-1, mask_and_clamp=1)
 
     v_val = cutlass.Float32(v[batch, 0, v_head, row])
     delta = beta * (v_val - ov)
     out_acc = qs + delta * qk
 
-    for i in cutlass.range_constexpr(D // 4):
-        for c in cutlass.range_constexpr(4):
-            tmp[c] = sr[i, c] + sK[i * 4 + c] * delta
-        state_tile = cute.local_tile(state_out, (1, 1, 1, 4), (batch, v_head, row, i))
-        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_last)
+    # State store: symmetric with the load, same constexpr-index if/else.
+    if half == 0:
+        for i in cutlass.range_constexpr(D // 2 // 4):
+            for c in cutlass.range_constexpr(4):
+                tmp[c] = sr[i, c] + sK[i * 4 + c] * delta
+            state_tile = cute.local_tile(state_out, (1, 1, 1, 4), (batch, v_head, row, i))
+            cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_last)
+    else:
+        for i in cutlass.range_constexpr(D // 2 // 4):
+            t = D // 2 // 4 + i
+            for c in cutlass.range_constexpr(4):
+                tmp[c] = sr[i, c] + sK[t * 4 + c] * delta
+            state_tile = cute.local_tile(state_out, (1, 1, 1, 4), (batch, v_head, row, t))
+            cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_last)
 
+    # Both threads in each pair write identical out_acc — idempotent within a warp.
     out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
 

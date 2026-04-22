@@ -80,7 +80,8 @@ def run_benchmark(
     from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
     solution = Solution.model_validate_json(solution_json)
-    config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    _iter = int(os.environ.get("FIB_ITERATIONS", "20"))
+    config = BenchmarkConfig(warmup_runs=3, iterations=_iter, num_trials=3)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -214,6 +215,110 @@ def print_results(results: dict):
                 print("    --- end ptxas ---")
 
 
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+def run_ncu(
+    solution_json: str,
+    batch_size: int = 1,
+) -> dict:
+    """Run NCU profiling on one workload for a given batch_size.
+
+    Returns a dict with keys:
+      "batch_size", "workload_uuid", "ncu_output" (raw NCU report text),
+      "ptxas_tail" (ptxas register/spill lines if available).
+    """
+    import io
+    import os
+    import sys
+
+    os.environ["MSINFER_DUMP_SASS"] = "1"
+
+    from flashinfer_bench import Solution, TraceSet
+    import flashinfer_bench.agents as agents
+
+    solution = Solution.model_validate_json(solution_json)
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+
+    if solution.definition not in trace_set.definitions:
+        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+
+    workloads = trace_set.workloads.get(solution.definition, [])
+    matching = [
+        w for w in workloads
+        if w.workload.axes.get("batch_size") == batch_size
+    ]
+    if not matching:
+        raise ValueError(f"No workload found with batch_size={batch_size}")
+
+    workload = matching[0]
+    print(f"[run_ncu] batch_size={batch_size} workload={workload.workload.uuid[:8]}")
+
+    agents_api = [a for a in dir(agents) if not a.startswith("_")]
+    print(f"[run_ncu] agents API: {agents_api}", flush=True)
+
+    # --- Try flashinfer_bench_list_ncu_options to understand the API ---
+    list_opts_fn = getattr(agents, "flashinfer_bench_list_ncu_options", None)
+    if list_opts_fn is not None:
+        try:
+            ncu_opts = list_opts_fn()
+            print(f"[run_ncu] ncu_options: {ncu_opts}", flush=True)
+        except Exception as e:
+            print(f"[run_ncu] list_ncu_options error: {e}", flush=True)
+
+    # --- Try ncu directly (simpler function) ---
+    ncu_direct = getattr(agents, "ncu", None)
+    ncu_direct_help = None
+    if ncu_direct is not None:
+        try:
+            import inspect
+            ncu_direct_help = inspect.signature(ncu_direct)
+            print(f"[run_ncu] agents.ncu signature: {ncu_direct_help}", flush=True)
+        except Exception as e:
+            print(f"[run_ncu] ncu sig error: {e}", flush=True)
+
+    # --- Try solution_handler approach ---
+    sh = getattr(agents, "solution_handler", None)
+    sh_help = None
+    if sh is not None:
+        try:
+            import inspect
+            sh_help = str(inspect.signature(sh))
+            print(f"[run_ncu] solution_handler sig: {sh_help}", flush=True)
+        except Exception as e:
+            print(f"[run_ncu] sh sig error: {e}", flush=True)
+
+    # --- Try ncu subprocess as fallback ---
+    import subprocess as sp
+    ncu_path = sp.run(["which", "ncu"], capture_output=True, text=True).stdout.strip()
+    print(f"[run_ncu] ncu binary: {ncu_path!r}", flush=True)
+
+    result = {
+        "batch_size": batch_size,
+        "workload_uuid": workload.workload.uuid,
+        "agents_api": agents_api,
+        "ncu_path": ncu_path,
+        "ncu_direct_sig": str(ncu_direct_help) if ncu_direct_help else None,
+        "sh_sig": sh_help,
+    }
+
+    # Grab ptxas stats from the SASS dump dir if populated.
+    import subprocess
+    ptxas_lines = []
+    sass_dir = "/tmp/cute-asm"
+    if os.path.isdir(sass_dir):
+        for fn in os.listdir(sass_dir):
+            fp = os.path.join(sass_dir, fn)
+            try:
+                with open(fp) as fh:
+                    for ln in fh:
+                        if any(kw in ln for kw in ("registers", "spill", "smem", "ptxas")):
+                            ptxas_lines.append(ln.rstrip())
+            except Exception:
+                pass
+    result["ptxas_tail"] = "\n".join(ptxas_lines[-40:])
+
+    return result
+
+
 @app.local_entrypoint()
 def main(
     kernel_dir: str = "",
@@ -273,6 +378,66 @@ def main(
         return
 
     print_results(results)
+
+
+@app.local_entrypoint()
+def ncu_profile(
+    kernel_dir: str = "gdn_decode",
+    batch_sizes: str = "1,8,64",
+    out_file: str = "out/ncu-baseline.md",
+):
+    """Run NCU profiling for batch_sizes (comma-separated) and write a markdown report.
+
+    Usage:
+        python3 -m modal run scripts/run_modal.py::ncu_profile --kernel-dir gdn_decode
+    """
+    import json as _json
+
+    kdir = kernel_dir or None
+    try:
+        from scripts.pack_solution import pack_solution
+        solution_path = pack_solution(kernel_dir=kdir)
+    except ImportError:
+        solution_path = _minimal_pack(kdir)
+
+    solution_json = solution_path.read_text()
+    meta = _json.loads(solution_json)
+    print(f"Loaded: {meta['name']} ({meta['definition']})")
+
+    target_batches = [int(b.strip()) for b in batch_sizes.split(",")]
+    all_results = []
+
+    for bs in target_batches:
+        print(f"\nRunning NCU profile for batch_size={bs}...")
+        result = run_ncu.remote(solution_json, batch_size=bs)
+        all_results.append(result)
+        print(f"  workload: {result['workload_uuid'][:8]}")
+        if result.get("ncu_output"):
+            print("  --- NCU output ---")
+            for ln in result["ncu_output"].splitlines()[-80:]:
+                print(f"  {ln}")
+        if result.get("ncu_result"):
+            print(f"  --- ncu_result ---\n  {result['ncu_result'][:2000]}")
+        if result.get("ptxas_tail"):
+            print("  --- ptxas stats ---")
+            for ln in result["ptxas_tail"].splitlines():
+                print(f"  {ln}")
+
+    # Write markdown report.
+    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w") as f:
+        f.write(f"# NCU Baseline — {meta['name']}\n\n")
+        for r in all_results:
+            f.write(f"## batch_size={r['batch_size']} (workload {r['workload_uuid'][:8]})\n\n")
+            if r.get("ncu_output"):
+                f.write("### NCU Output\n```\n")
+                f.write(r["ncu_output"][-4000:])
+                f.write("\n```\n\n")
+            if r.get("ptxas_tail"):
+                f.write("### ptxas stats\n```\n")
+                f.write(r["ptxas_tail"])
+                f.write("\n```\n\n")
+    print(f"\nNCU report written to {out_file}")
 
 
 def _minimal_pack(kernel_dir: str | None = None) -> Path:

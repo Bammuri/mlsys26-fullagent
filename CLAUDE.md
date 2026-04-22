@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a starter kit for the **FlashInfer AI Kernel Generation Contest @ MLSys 2026** — a competition to create high-performance GPU kernels for LLM operations on NVIDIA Blackwell B200 GPUs. Three tracks: fused_moe, sparse_attention, gated_delta_net.
 
+## Benchmark Policy
+
+- **항상 모든 워크로드**에 대해 테스트 (max_workloads 제한 없음)
+- **실행 환경**: Modal B200 (`python3 -m modal run scripts/run_modal.py`) — kjms2026 워크스페이스 사용
+- **기본 테스트 세팅**: `BenchmarkConfig(warmup_runs=3, iterations=20, num_trials=3)`
+- **본판(제출 전 최종) 세팅**: `BenchmarkConfig(warmup_runs=3, iterations=50, num_trials=3)`
+
 ## Common Commands
 
 ```bash
@@ -15,8 +22,8 @@ python scripts/pack_solution.py
 # Run benchmarks on local GPU (requires FIB_DATASET_PATH env var)
 python scripts/run_local.py
 
-# Run benchmarks on Modal B200 cloud instances
-modal run scripts/run_modal.py
+# Run benchmarks on Modal B200 cloud instances (기본 세팅: warmup=3, iter=20, trials=3)
+python3 -m modal run scripts/run_modal.py --kernel-dir gdn_decode
 
 # Run FlashInfer-Bench evaluation directly (example: GDN decode)
 flashinfer-bench run \
