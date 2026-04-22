@@ -1,9 +1,0 @@
-[solution]
-name = "gdn-cuda-v2"
-definition = "gdn_decode_qk4_v8_d128_k_last"
-author = "team"
-
-[build]
-language = "cuda"
-entry_point = "kernel.cu::kernel"
-destination_passing_style = true
