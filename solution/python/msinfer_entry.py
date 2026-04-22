@@ -55,6 +55,7 @@ def _get_gate_beta(A_log: torch.Tensor, a: torch.Tensor, dt_bias: torch.Tensor, 
     key = (id(A_log), id(a), id(dt_bias), id(b))
     if _PREP_CACHE_KEY == key and _PREP_CACHE_VALUE is not None:
         return _PREP_CACHE_VALUE
+
     x = a.float() + dt_bias.float()
     g = -torch.exp(A_log.float()) * F.softplus(x)
     beta = torch.sigmoid(b.float())
@@ -104,7 +105,13 @@ def _get_compiled_runner(
         return _RUNNER_CACHE_VALUE
 
     gdn = GDN(is_persistent=is_persistent)
-    compiled_gdn = cute.compile[EnableTVMFFI](
+    compile_options = (
+        EnableTVMFFI,
+        cute.PtxasOptions(
+            "--allow-expensive-optimizations=true"
+        ),
+    )
+    compiled_gdn = cute.compile[compile_options](
         gdn,
         from_dlpack(q, assumed_align=16, enable_tvm_ffi=True).iterator,
         from_dlpack(k, assumed_align=16, enable_tvm_ffi=True).iterator,

@@ -192,7 +192,7 @@ __global__ __launch_bounds__(kThreads, 4) void gdn_prefill_kernel(
     }
     __syncthreads();
 
-    #pragma unroll 4
+    #pragma unroll 8
     for (int i = 0; i < C_actual; ++i) {
       const int64_t t = chunk_start + i;
       const int64_t q_offset = ((t * kNumQHeads + q_head_idx) * kHeadSize) + col_base;
