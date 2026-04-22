@@ -40,12 +40,26 @@ DEFAULT_SCALE = 1.0 / math.sqrt(float(D))
 SOFTPLUS_BETA = 1.0
 SOFTPLUS_THRESHOLD = 20.0
 
-# v2 layout — mirrors static-CUDA v17/v7 on fullagent/submission-gdn-v7-v17:
-# grid = (B * HV * kSplits, 1, 1); block = (kWarpThreads, 1, 1) = 1 warp.
-# Each lane owns one V-row out of (kSplits=4) × (kRowsPerBlock=32) = 128.
-kSplits       = 4
-kRowsPerBlock = D // kSplits    # 32
-kWarpThreads  = kRowsPerBlock   # 32 — one warp per block
+# High-B variant (default): 4-way split, 32 threads per block.
+#   grid = (B * HV * 4, 1, 1); block = (32, 1, 1)
+kSplits_H       = 4
+kRowsPerBlock_H = D // kSplits_H   # 32
+kWarpThreads_H  = kRowsPerBlock_H  # 32
+
+# Low-B variant (B ≤ LOW_B_MAX): 8-way split, 16 threads per block.
+#   grid = (B * HV * 8, 1, 1); block = (16, 1, 1)
+#   Doubles grid size at low batch → more SMs active, ~2× throughput.
+kSplits_L       = 8
+kRowsPerBlock_L = D // kSplits_L   # 16
+kWarpThreads_L  = kRowsPerBlock_L  # 16
+
+# Dispatch threshold: use low variant for batch_size ≤ this value.
+_LOW_B_MAX = int(os.environ.get("MSINFER_LOW_B_MAX", "8"))
+
+# Keep aliases for backward compatibility in _gdn_decode_jit.
+kSplits       = kSplits_H
+kRowsPerBlock = kRowsPerBlock_H
+kWarpThreads  = kWarpThreads_H
 
 # ----------------------------------------------------------------------------
 # Compile options — sm_100a + -O3 + fast math are the ones that move SASS.
@@ -199,6 +213,104 @@ def _gdn_decode_dev(
     out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
 
+@cute.kernel
+def _gdn_decode_dev_low(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    state_in: cute.Tensor,
+    A_log: cute.Tensor,
+    a_in: cute.Tensor,
+    dt_bias: cute.Tensor,
+    b_in: cute.Tensor,
+    out: cute.Tensor,
+    state_out: cute.Tensor,
+    scale: cutlass.Constexpr[float],
+):
+    """Low-B variant: kSplits=8, 16 threads/block → 2× grid at low batch."""
+    bid_x, _, _ = cute.arch.block_idx()
+    tid, _, _ = cute.arch.thread_idx()
+
+    split   = bid_x % kSplits_L
+    v_head  = (bid_x // kSplits_L) % HV
+    batch   = bid_x // (kSplits_L * HV)
+    qk_head = v_head // (HV // HQ)
+    row     = split * kRowsPerBlock_L + tid   # 0..127
+
+    smem = cutlass.utils.SmemAllocator()
+    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
+    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((D,)), 16)
+    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 8
+        idx = tid + j * kWarpThreads_L
+        sQ[idx] = cutlass.Float32(q[batch, 0, qk_head, idx])
+        sK[idx] = cutlass.Float32(k[batch, 0, qk_head, idx])
+
+    a_val = cutlass.Float32(a_in[batch, 0, v_head]) + cutlass.Float32(dt_bias[v_head])
+    sp = _softplus_stable(a_val)
+    g = cute.exp(-cute.exp(cutlass.Float32(A_log[v_head]), fastmath=True) * sp, fastmath=True)
+    beta = _sigmoid_stable(cutlass.Float32(b_in[batch, 0, v_head]))
+
+    cute.arch.sync_warp()
+
+    # qk butterfly: only 4 levels (log2(16)=4) with mask_and_clamp=15.
+    qk = cutlass.Float32(0.0)
+    for j in cutlass.range_constexpr(D // kWarpThreads_L):  # 8
+        idx = tid + j * kWarpThreads_L
+        qk += sQ[idx] * sK[idx]
+    for offset in [8, 4, 2, 1]:
+        qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=15)
+
+    sr = cute.make_rmem_tensor(cute.make_layout((D // 4, 4), stride=(4, 1)), cutlass.Float32)
+    tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
+    ev_first = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
+    ev_last  = cute.nvgpu.CacheEvictionPriority.EVICT_LAST
+    ov = cutlass.Float32(0.0)
+    qs = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(D // 4):
+        state_tile = cute.local_tile(state_in, (1, 1, 1, 4), (batch, v_head, row, i))
+        cute.autovec_copy(state_tile, tmp, l1c_evict_priority=ev_first)
+        for c in cutlass.range_constexpr(4):
+            s = tmp[c] * g
+            sr[i, c] = s
+            ov += sK[i * 4 + c] * s
+            qs += sQ[i * 4 + c] * s
+
+    v_val = cutlass.Float32(v[batch, 0, v_head, row])
+    delta = beta * (v_val - ov)
+    out_acc = qs + delta * qk
+
+    for i in cutlass.range_constexpr(D // 4):
+        for c in cutlass.range_constexpr(4):
+            tmp[c] = sr[i, c] + sK[i * 4 + c] * delta
+        state_tile = cute.local_tile(state_out, (1, 1, 1, 4), (batch, v_head, row, i))
+        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_last)
+
+    out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
+
+
+@cute.jit
+def _gdn_decode_jit_low(
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    state_in: cute.Tensor,
+    A_log: cute.Tensor,
+    a_in: cute.Tensor,
+    dt_bias: cute.Tensor,
+    b_in: cute.Tensor,
+    out: cute.Tensor,
+    state_out: cute.Tensor,
+):
+    B = q.layout.shape[0]
+    _gdn_decode_dev_low(
+        q, k, v, state_in, A_log, a_in, dt_bias, b_in, out, state_out,
+        DEFAULT_SCALE,
+    ).launch(
+        grid=(B * HV * kSplits_L, 1, 1),
+        block=(kWarpThreads_L, 1, 1),
+    )
+
+
 @cute.jit
 def _gdn_decode_jit(
     q: cute.Tensor,
@@ -269,5 +381,9 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     """DPS entrypoint for gdn_decode_qk4_v8_d128_k_last."""
     tensors = [q, k, v, state, A_log, a, dt_bias, b, output, new_state]
     call_args = [q, k, v, state, A_log, a, dt_bias, b, output, new_state]
-    _dispatch("decode", _gdn_decode_jit, tensors, call_args)
+    B = q.shape[0]
+    if B <= _LOW_B_MAX:
+        _dispatch("decode_low", _gdn_decode_jit_low, tensors, call_args)
+    else:
+        _dispatch("decode_high", _gdn_decode_jit, tensors, call_args)
 
