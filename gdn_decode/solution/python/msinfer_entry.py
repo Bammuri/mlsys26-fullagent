@@ -165,10 +165,11 @@ def _gdn_decode_dev(
     #   moves + vectorized gmem/smem reads on the inner axis.
     sr = cute.make_rmem_tensor(cute.make_layout((D // 4, 4), stride=(4, 1)), cutlass.Float32)
     tmp = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), cutlass.Float32)
-    # EVICT_FIRST on state gmem↔reg: each float4 tile is used once and never
-    # re-read — demote from L1 first so next block's state prologue lands in a
-    # colder line and K/Q smem fills aren't evicted by state churn.
+    # State load: EVICT_FIRST — each line read once, no reuse in this call.
+    # State store: EVICT_LAST — this call's output is the next call's input;
+    # keeping it hot in L2 avoids an HBM round-trip on the next decode step.
     ev_first = cute.nvgpu.CacheEvictionPriority.EVICT_FIRST
+    ev_last  = cute.nvgpu.CacheEvictionPriority.EVICT_LAST
     ov = cutlass.Float32(0.0)
     qs = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(D // 4):  # 32 tiles × 4 elems
@@ -193,7 +194,7 @@ def _gdn_decode_dev(
         state_tile = cute.local_tile(
             state_out, (1, 1, 1, 4), (batch, v_head, row, i),
         )
-        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_first)
+        cute.autovec_copy(tmp, state_tile, l1c_evict_priority=ev_last)
 
     out[batch, 0, v_head, row] = cutlass.BFloat16(cutlass.Float32(scale) * out_acc)
 
