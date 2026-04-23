@@ -589,6 +589,71 @@ Confirmed: `config.toml` is `language="python"` + `entry_point="msinfer_entry.py
 - Reading: the change helped the short sample but regressed materially on the broader deterministic sample, likely by increasing pressure on longer-sequence cases.
 - Decision: **REVERT**. The apparent 4-workload win was a misleading short-sample effect.
 
+#### Iteration C35 — re-baseline current active CuTe lane on 30 workloads  → KEEP BASELINE
+- Measurement path: `PYENV_VERSION=fi-bench pyenv exec modal run scripts/run_modal.py --summary-only --max-workloads 30 --sample-seed 42`
+- Result: **0.242 ms** (`PASSED=30/30`), worst abs err **8.27e-03**, worst rel err **1.93e+03**.
+- Quick gate on the same working tree: **0.284 ms** (`PASSED=4/4`) with `--max-workloads 4 --sample-seed 42`.
+- Reading: the current repository state is materially better than the older CuTe baseline in this log. Treat **0.242 ms** as the new best verified active-lane baseline for this branch.
+
+#### Iteration C36 — lazy `torch.compile` on gate/beta preprocessing  → REVERT
+- Change: wrapped the eager `_get_gate_beta()` pointwise path in a lazy `torch.compile(fullgraph=True)` helper, with eager fallback on compile/runtime failure.
+- Quick-gate result: **0.292 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.008 ms (+2.8%)**.
+- Reading: even without correctness issues, the compiled preprocessing path added enough overhead to lose against the already simple eager kernels + id-based cache.
+- Decision: **REVERT**.
+
+#### Iteration C37 — `num_regs_cudacore=240 → 241`  → REVERT
+- Change: probed the immediately adjacent register point above the verified-safe `240`.
+- Quick-gate result: **RUNTIME_ERROR=4/4**.
+- Reading: the current cudacore-warp stability boundary is still razor-thin; `241` is already unsafe in this environment.
+- Decision: **REVERT**.
+
+#### Iteration C38 — `num_regs_other=64 → 60`  → REVERT
+- Change: reduced the load/epilogue warp-group register budget to see whether auxiliary-warp pressure could be trimmed safely.
+- Quick-gate result: **RUNTIME_ERROR=4/4**.
+- Reading: not only the cudacore warp but also the "other" warp budget sits on a narrow stability edge.
+- Decision: **REVERT**.
+
+#### Iteration C39 — add `ptxas --def-load-cache=cg`  → REVERT
+- Change: kept `--allow-expensive-optimizations=true`, added `--def-load-cache=cg` in `solution/python/msinfer_entry.py`.
+- Quick-gate result: **0.360 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.076 ms (+26.8%)**.
+- Reading: a gentler default load-cache hint was still strongly harmful here; the current compiler/device pairing prefers the default policy.
+- Decision: **REVERT**.
+
+#### Iteration C40 — `buffer_align_bytes=1024 → 512`  → REVERT
+- Change: reduced shared-memory section alignment to shrink padding and test whether the kernel was being held back by SMEM footprint.
+- Quick-gate result: **0.358 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.074 ms (+26.1%)**.
+- Reading: the larger alignment is not wasted decoration; it appears to matter for the current TMA/SMEM layout and/or bank behavior.
+- Decision: **REVERT**.
+
+#### Iteration C41 — omit `cluster=(1,1,1)` at launch  → REVERT
+- Change: removed the explicit cluster launch argument while keeping all other launch parameters the same.
+- Quick-gate result: **0.288 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.004 ms (+1.4%)**.
+- Reading: even the no-op-looking single-cluster metadata is slightly better than relying on the default launch path in this CuTe runtime.
+- Decision: **REVERT**.
+
+#### Iteration C42 — omit `min_blocks_per_mp=1` at launch  → REVERT
+- Change: restored `cluster=(1,1,1)` and removed only the `min_blocks_per_mp=1` launch hint.
+- Quick-gate result: **0.340 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.056 ms (+19.7%)**.
+- Reading: the launch hint is not redundant; the current kernel/runtime combination depends on it for a materially better schedule.
+- Decision: **REVERT**.
+
+#### Iteration C43 — `num_regs_mma=64 → 56`  → REVERT
+- Change: lowered the dedicated MMA warp register budget to test whether the helper-MMA path was overprovisioned.
+- Quick-gate result: **0.343 ms** (`PASSED=4/4`) vs baseline **0.284 ms**.
+- Δ: **+0.059 ms (+20.8%)**.
+- Reading: the MMA warp is not a good place to claw back register budget; reducing it hurts enough to overwhelm any theoretical occupancy gain.
+- Decision: **REVERT**.
+
+### CuTe micro-tuning status after C35-C43
+- Best verified active-lane result on this branch remains **0.242 ms** over the 30-workload deterministic sample.
+- Every new probe in this round either regressed clearly or failed at runtime.
+- Practical conclusion: the easy launch/cache/register/smem micro-tuning space around the current CuTe kernel is largely exhausted; the next real gain will need a more structural kernel change rather than another one-line knob flip.
+
 ---
 
 ## Optimization backlog (from workflow.md §7)
