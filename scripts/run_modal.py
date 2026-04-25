@@ -9,6 +9,7 @@ Setup (one-time):
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
+from __future__ import annotations
 
 import os
 import sys
@@ -54,6 +55,7 @@ def run_benchmark(
     max_seq_len: int = 0,
     min_seq_len: int = 0,
     dump_sass: bool = False,
+    extra_env: dict | None = None,
 ) -> dict:
     """Run benchmark on Modal B200 and return results.
 
@@ -65,6 +67,8 @@ def run_benchmark(
     dump_sass:     if True, sets MSINFER_DUMP_SASS=1 so msinfer_entry.py emits
                    PTX/cubin/ptxas-verbose into /tmp/cute-asm, then tars + base64
                    encodes the directory into the returned dict's `sass_dump`.
+    extra_env:     dict of env vars to set inside the worker before loading the
+                   solution — e.g. {"MSINFER_TMA": "1"} to toggle kernel variants.
     """
     import base64
     import io
@@ -73,11 +77,14 @@ def run_benchmark(
 
     if dump_sass:
         os.environ["MSINFER_DUMP_SASS"] = "1"
+    if extra_env:
+        for k, v in extra_env.items():
+            os.environ[str(k)] = str(v)
 
     from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
     solution = Solution.model_validate_json(solution_json)
-    config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    config = BenchmarkConfig(warmup_runs=3, iterations=50, num_trials=3)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -216,12 +223,25 @@ def main(
     min_seq_len: int = 0,
     dump_sass: bool = False,
     sass_out: str = "out/sass-dump.tar.gz",
+    env: str = "",
 ):
     """Pack solution and run benchmark on Modal.
 
     kernel_dir: which per-kernel subdir to pack (e.g. "gdn_decode", "gdn_prefill").
                 If empty, inferred when only one subdir under the repo has a config.toml.
+    env:        comma-separated KEY=VALUE list forwarded to the worker before
+                loading the solution (e.g. "MSINFER_TMA=1,MSINFER_REGCAP=96").
     """
+    extra_env: dict[str, str] = {}
+    if env:
+        for part in env.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(f"--env entry '{part}' missing '='")
+            k, v = part.split("=", 1)
+            extra_env[k.strip()] = v.strip()
     kdir = kernel_dir or None
     # Attempt flashinfer-bench-based packing first; fall back to a minimal
     # local JSON packer when the library isn't installed locally (e.g. macOS).
@@ -243,12 +263,15 @@ def main(
         f"(max_workloads={max_workloads}, max_seq_len={max_seq_len}, "
         f"min_seq_len={min_seq_len}, dump_sass={dump_sass})..."
     )
+    if extra_env:
+        print(f"Forwarding env to worker: {extra_env}")
     results = run_benchmark.remote(
         solution_json,
         max_workloads=max_workloads,
         max_seq_len=max_seq_len,
         min_seq_len=min_seq_len,
         dump_sass=dump_sass,
+        extra_env=extra_env if extra_env else None,
     )
 
     # If SASS dumping was requested, peel off the tarball before print_results.
