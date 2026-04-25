@@ -25,13 +25,28 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# Default subfolder whose config.toml + solution/ tree is packed and benchmarked.
+DEFAULT_SUBFOLDER = "gdn_prefill_qk4_v8_d128_k_last"
+
+# CUTLASS DSL JIT requires CUDA 13 toolchain + cuda-python; the prefill kernel
+# also pulls in nvidia-cutlass-dsl. Keep this image in sync with run_modal_subfolder.py.
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.2.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+        "nvidia-cutlass-dsl",
+        "cuda-python",
+    )
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=10800, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -104,18 +119,23 @@ def print_results(results: dict):
 
 @app.local_entrypoint()
 def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+    """Pack the default subfolder's solution and run benchmark on Modal."""
+    import scripts.pack_solution as ps
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    # Redirect pack_solution to the prefill subfolder so its config.toml +
+    # solution/python/ tree are used. Mirrors run_modal_subfolder.py's pattern.
+    ps.PROJECT_ROOT = PROJECT_ROOT / DEFAULT_SUBFOLDER
+
+    print(f"Packing solution from {DEFAULT_SUBFOLDER}...")
+    solution_path = ps.pack_solution()
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    config = BenchmarkConfig(warmup_runs=3, iterations=30, num_trials=3)
+    results = run_benchmark.remote(solution, config)
 
     if not results:
         print("No results returned!")
